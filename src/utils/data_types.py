@@ -231,21 +231,44 @@ def get_common_abbreviations() -> dict:
 def expand_abbreviation(name: str) -> List[str]:
     """
     Expand abbreviations in column name to possible full forms.
-    
+
     Examples:
-        'cust_id' -> ['customer_id', 'client_id', ...]
+        'cust_id' -> ['custid', 'customerid', 'clientid', ...]
+        'prod_id' -> ['prodid', 'productid', 'itemid', ...]
+        'ProductID' -> ['productid'] (already expanded, no change)
     """
+    import re
+
     abbrevs = get_common_abbreviations()
     name_lower = name.lower()
-    
-    expansions = [name_lower]
-    
+
+    # Normalize: remove underscores, spaces, dashes for comparison
+    normalized = normalize_column_name(name_lower)
+    expansions = [normalized]
+
+    # Split name into word parts (by underscore, space, dash, or camelCase)
+    # This creates tokens like: "prod_id" -> ["prod", "id"]
+    #                           "ProductID" -> ["product", "id"]
+    parts = re.split(r'[_\s-]+', name_lower)
+
+    # Also handle camelCase: "ProductID" -> ["product", "id"]
+    split_parts = []
+    for part in parts:
+        # Split by camelCase boundaries (lowercase followed by uppercase)
+        subparts = re.sub(r'([a-z])([A-Z])', r'\1 \2', part).split()
+        split_parts.extend([p.lower() for p in subparts])
+
+    # Now expand each part if it's an abbreviation
     for abbrev, full_forms in abbrevs.items():
-        if abbrev in name_lower:
+        if abbrev in split_parts:
+            # Replace the abbreviation with each possible expansion
             for full_form in full_forms:
                 if full_form != abbrev:
-                    expanded = name_lower.replace(abbrev, full_form)
+                    # Create new parts list with expansion
+                    new_parts = [full_form if p == abbrev else p for p in split_parts]
+                    # Join and normalize
+                    expanded = ''.join(new_parts)
                     if expanded not in expansions:
                         expansions.append(expanded)
-    
+
     return expansions

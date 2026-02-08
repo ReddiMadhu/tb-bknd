@@ -93,6 +93,12 @@ class Config:
     # Enable LLM validation (set to False to disable LLM entirely)
     ENABLE_LLM_VALIDATION: bool = os.getenv("ENABLE_LLM_VALIDATION", "true").lower() == "true"
 
+    # High overlap LLM validation - NEW!
+    # For columns with 50-80% overlap, use LLM to check semantic relationship
+    ENABLE_HIGH_OVERLAP_LLM_VALIDATION: bool = os.getenv("ENABLE_HIGH_OVERLAP_LLM_VALIDATION", "true").lower() == "true"
+    HIGH_OVERLAP_LLM_MIN_THRESHOLD: float = 0.50  # 50% minimum overlap to trigger LLM check
+    HIGH_OVERLAP_LLM_MIN_CONFIDENCE: float = 0.60  # 60% LLM confidence required
+
     # Semantic duplicate detection thresholds
     SEMANTIC_DUPLICATE_MIN_OVERLAP: float = 0.80  # 80% value overlap required
     SEMANTIC_DUPLICATE_MIN_CONFIDENCE: float = 0.80  # 80% LLM confidence required

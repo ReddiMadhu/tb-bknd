@@ -98,6 +98,32 @@ class ResultStore:
         result_file = Path(config.RESULT_DIR) / job_id / "report.json"
         return result_file.exists()
 
+    def update_result(self, job_id: str, result: Dict[str, Any]) -> bool:
+        """
+        Update existing analysis result
+
+        Args:
+            job_id: Job identifier
+            result: Updated analysis result dictionary
+
+        Returns:
+            True if updated successfully
+        """
+        result_file = Path(config.RESULT_DIR) / job_id / "report.json"
+
+        if not result_file.exists():
+            logger.warning(f"Result file not found for job {job_id}, cannot update")
+            return False
+
+        try:
+            with open(result_file, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            logger.info(f"Updated result for job {job_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update result for job {job_id}: {e}")
+            return False
+
 
 # Global result store instance
 result_store = ResultStore()

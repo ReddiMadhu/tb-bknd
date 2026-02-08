@@ -1,13 +1,14 @@
 # Excel Relationship Discovery System
 
-A production-ready system that discovers relationships between N Excel files (from Tableau extracts or any BI tool) by combining deterministic profiling (80%) with LLM semantic reasoning (20%).
+A production-ready system that discovers relationships between N Excel files from **any business data source** by combining deterministic profiling (80%) with LLM semantic reasoning (20%). Works across all industries: e-commerce, healthcare, finance, manufacturing, and more.
 
 ## Features
 
 - **30+ Relationship Detection Cases**: Exact matches, semantic similarity, format mismatches, composite keys, temporal joins, and more
 - **Hybrid Approach**: Deterministic profiling + LLM validation (Llama-3.3B via Azure AI Foundry)
+- **Domain-Agnostic Business Validation**: Analyzes relationship validity, data coherence, and actionable insights for ANY business domain
 - **Comprehensive Profiling**: Deep statistical and semantic analysis of every column
-- **JSON Report Output**: Detailed report with confidence scores, warnings, and recommended joins
+- **JSON Report Output**: Detailed report with confidence scores, business insights, and recommendations
 - **Optimized for 5 Files**: Fast processing with intelligent caching
 
 ## Quick Start
@@ -171,18 +172,34 @@ See [azure_foundry_setup.md](./azure_foundry_setup.md) for detailed instructions
 
 ## Example Use Cases
 
-### Tableau Extract Analysis
+### E-Commerce Analysis
 
 ```bash
 python -m src.main \
-  extracts/Orders.xlsx \
-  extracts/Customers.xlsx \
-  extracts/Products.xlsx
+  data/orders.xlsx \
+  data/customers.xlsx \
+  data/products.xlsx \
+  data/shipments.xlsx
 ```
 
-### Pre-joined Data Detection
+### Healthcare Data Integration
 
-The system automatically detects when Tableau has pre-joined tables and recommends extraction strategies.
+```bash
+python -m src.main \
+  data/patients.xlsx \
+  data/visits.xlsx \
+  data/treatments.xlsx \
+  data/billing.xlsx
+```
+
+### Financial Services Analysis
+
+```bash
+python -m src.main \
+  data/accounts.xlsx \
+  data/transactions.xlsx \
+  data/customers.xlsx
+```
 
 ### Data Quality Issues
 

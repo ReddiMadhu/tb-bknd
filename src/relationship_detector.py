@@ -172,7 +172,15 @@ class RelationshipDetector:
         )
         if candidate:
             return candidate
-        
+
+        # CATEGORY 2.5: High Overlap + LLM Semantic Check (NEW!)
+        candidate = self._check_high_overlap_llm_validation(
+            file1, col1_name, col1_profile,
+            file2, col2_name, col2_profile
+        )
+        if candidate:
+            return candidate
+
         # CATEGORY 3: Semantic Similarity (requires LLM)
         candidate = self._check_semantic_similarity(
             file1, col1_name, col1_profile,
@@ -180,7 +188,7 @@ class RelationshipDetector:
         )
         if candidate:
             return candidate
-        
+
         return None
     
     # =========================================================================
@@ -371,7 +379,186 @@ class RelationshipDetector:
             transformation_needed=format_info["transformation"],
             cardinality="UNKNOWN"
         )
-    
+
+    # =========================================================================
+    # CATEGORY 2.5: HIGH OVERLAP + LLM SEMANTIC VALIDATION
+    # =========================================================================
+
+    def _check_high_overlap_llm_validation(
+        self,
+        file1: str, col1_name: str, col1_profile: Dict,
+        file2: str, col2_name: str, col2_profile: Dict
+    ) -> Optional[RelationshipCandidate]:
+        """
+        NEW: Check if columns with >50% content overlap are semantically related.
+        Uses LLM to judge based on:
+        1. Content overlap percentage
+        2. Column name semantic meaning
+        3. Sample values
+
+        This catches relationships that rule-based methods might miss.
+        """
+        # Skip if LLM validation is not enabled
+        if not Config.ENABLE_LLM_VALIDATION or not Config.ENABLE_HIGH_OVERLAP_LLM_VALIDATION:
+            return None
+
+        # Must be compatible data types
+        if col1_profile["data_type"] != col2_profile["data_type"]:
+            return None
+
+        # Calculate value overlap
+        df1 = self.dataframes[file1]
+        df2 = self.dataframes[file2]
+
+        overlap_pct, exact_matches, _ = calculate_value_overlap(
+            df1[col1_name],
+            df2[col2_name]
+        )
+
+        # Only proceed if overlap is above minimum threshold (50% by default)
+        min_overlap = Config.HIGH_OVERLAP_LLM_MIN_THRESHOLD * 100
+        if overlap_pct < min_overlap:
+            return None
+
+        # Skip if names already match (will be caught by exact/variation match)
+        if col1_name == col2_name:
+            return None
+
+        # Skip if normalized names match
+        norm1 = col1_profile.get("normalized_name", "")
+        norm2 = col2_profile.get("normalized_name", "")
+        if norm1 and norm2 and norm1 == norm2:
+            return None
+
+        # Skip if name variations overlap (will be caught by variation match)
+        variations1 = set(col1_profile.get("name_variations", []))
+        variations2 = set(col2_profile.get("name_variations", []))
+        if variations1 & variations2:  # Intersection
+            return None
+
+        logger.debug(
+            f"Checking high overlap ({overlap_pct:.1f}%) with LLM: "
+            f"{col1_name} <-> {col2_name}"
+        )
+
+        # Prepare data for LLM
+        col1_samples = df1[col1_name].dropna().head(10).tolist()
+        col2_samples = df2[col2_name].dropna().head(10).tolist()
+
+        # Call LLM to validate semantic relationship
+        llm_result = self._ask_llm_relationship_validation(
+            file1, col1_name, col1_profile, col1_samples,
+            file2, col2_name, col2_profile, col2_samples,
+            overlap_pct
+        )
+
+        # Check if LLM confirms relationship
+        if not llm_result or not llm_result.get("is_related", False):
+            logger.debug(f"LLM rejected relationship: {col1_name} <-> {col2_name}")
+            return None
+
+        # LLM confidence should be above minimum threshold
+        llm_confidence = llm_result.get("confidence_score", 0)
+        min_confidence = Config.HIGH_OVERLAP_LLM_MIN_CONFIDENCE * 100
+        if llm_confidence < min_confidence:
+            logger.debug(
+                f"LLM confidence too low ({llm_confidence}% < {min_confidence}%): "
+                f"{col1_name} <-> {col2_name}"
+            )
+            return None
+
+        logger.success(
+            f"LLM confirmed relationship ({llm_confidence}%): "
+            f"{file1}.{col1_name} <-> {file2}.{col2_name}"
+        )
+
+        # Determine relationship type from LLM response
+        relationship_type = llm_result.get("relationship_type", "SEMANTIC_MATCH")
+        cardinality = llm_result.get("cardinality", "UNKNOWN")
+
+        # Calculate combined confidence (overlap + LLM)
+        combined_confidence = int((overlap_pct + llm_confidence) / 2)
+
+        # Determine confidence level
+        if combined_confidence >= 80:
+            confidence_level = "HIGH"
+        elif combined_confidence >= 60:
+            confidence_level = "MEDIUM"
+        else:
+            confidence_level = "LOW"
+
+        return self._create_candidate(
+            file1, col1_name, col1_profile,
+            file2, col2_name, col2_profile,
+            relationship_type=relationship_type,
+            confidence_level=confidence_level,
+            confidence_score=combined_confidence,
+            detection_method="HIGH_OVERLAP_LLM_VALIDATION",
+            overlap_pct=overlap_pct,
+            exact_matches=exact_matches,
+            cardinality=cardinality,
+            transformation_needed=llm_result.get("transformation_needed"),
+            requires_llm=False  # Already validated by LLM
+        )
+
+    def _ask_llm_relationship_validation(
+        self,
+        file1: str, col1_name: str, col1_profile: Dict, col1_samples: list,
+        file2: str, col2_name: str, col2_profile: Dict, col2_samples: list,
+        overlap_pct: float
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Ask LLM to validate if two columns represent a semantic relationship.
+        """
+        from src.llm_reasoner import LLMReasoner
+
+        try:
+            llm_reasoner = LLMReasoner()
+
+            if not llm_reasoner.llm:
+                logger.debug("LLM not available for relationship validation")
+                return None
+
+            # Build validation request
+            candidate = {
+                "source": {
+                    "file": file1,
+                    "column": col1_name,
+                    "data_type": col1_profile.get("data_type", "unknown"),
+                    "sample_values": col1_samples,
+                    "uniqueness": col1_profile.get("unique_percent", 0) / 100,
+                    "null_percent": col1_profile.get("null_percent", 0),
+                },
+                "target": {
+                    "file": file2,
+                    "column": col2_name,
+                    "data_type": col2_profile.get("data_type", "unknown"),
+                    "sample_values": col2_samples,
+                    "uniqueness": col2_profile.get("unique_percent", 0) / 100,
+                    "null_percent": col2_profile.get("null_percent", 0),
+                },
+                "statistics": {
+                    "value_overlap_percent": overlap_pct,
+                    "orphans_in_source": 0,
+                    "orphans_in_target": 0,
+                }
+            }
+
+            # Call LLM validator
+            result = llm_reasoner.validate_relationship(candidate)
+
+            logger.debug(
+                f"LLM validated {col1_name} <-> {col2_name}: "
+                f"related={result.get('is_related', False)}, "
+                f"confidence={result.get('confidence_score', 0)}%"
+            )
+
+            return result
+
+        except Exception as e:
+            logger.warning(f"LLM relationship validation failed: {e}")
+            return None
+
     # =========================================================================
     # CATEGORY 3: SEMANTIC SIMILARITY
     # =========================================================================

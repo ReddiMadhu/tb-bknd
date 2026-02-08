@@ -694,7 +694,7 @@ Consider:
 """
 
         try:
-            from langchain.schema import HumanMessage
+            from langchain_core.messages import HumanMessage
             response = self.llm_reasoner.llm.invoke([HumanMessage(content=prompt)])
             result = response.content.strip()
 

@@ -770,6 +770,7 @@ async def delete_relationship(
         result_data = result_store.get_result(job_id)
 
         if not result_data:
+            logger.error(f"Result not found for job {job_id}")
             raise HTTPException(
                 status_code=404,
                 detail={
@@ -781,8 +782,10 @@ async def delete_relationship(
                 }
             )
 
-        # Find and mark relationship as deleted
-        relationships = result_data.get("result", {}).get("relationships", [])
+        # The result structure is flat - relationships are at top level
+        # NOT nested under "result" key
+        relationships = result_data.get("relationships", [])
+        logger.info(f"Found {len(relationships)} total relationships in job {job_id}")
         found = False
 
         for rel in relationships:
@@ -790,9 +793,13 @@ async def delete_relationship(
                 rel["deleted"] = True
                 rel["deleted_at"] = datetime.now().isoformat()
                 found = True
+                logger.info(f"Marked relationship {relationship_id} as deleted")
                 break
 
         if not found:
+            # Log available relationship IDs for debugging
+            available_ids = [r.get("relationship_id") for r in relationships]
+            logger.error(f"Relationship {relationship_id} not found. Available IDs: {available_ids}")
             raise HTTPException(
                 status_code=404,
                 detail={
@@ -801,7 +808,8 @@ async def delete_relationship(
                         "message": f"Relationship {relationship_id} not found in job {job_id}",
                         "details": {
                             "job_id": job_id,
-                            "relationship_id": relationship_id
+                            "relationship_id": relationship_id,
+                            "available_relationships": available_ids
                         }
                     }
                 }
@@ -832,6 +840,117 @@ async def delete_relationship(
                 "error": {
                     "code": "DELETE_RELATIONSHIP_FAILED",
                     "message": "Failed to delete relationship",
+                    "details": str(e)
+                }
+            }
+        )
+
+
+@router.patch("/{job_id}/relationships/{relationship_id}/inclusion")
+async def update_relationship_inclusion(
+    job_id: str,
+    relationship_id: str,
+    request: dict
+):
+    """
+    Update the inclusion state of a specific relationship.
+
+    This marks the relationship as included or excluded in the result JSON.
+    Excluded relationships will still be stored but can be visually hidden in the UI.
+
+    Args:
+        job_id: The job ID
+        relationship_id: The relationship ID to update
+        request: { "included": true/false }
+
+    Returns:
+        Success response with updated inclusion state
+    """
+    try:
+        # Validate request body
+        included = request.get("included")
+        if included is None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": "Missing 'included' field in request body",
+                        "details": {"expected": "{ \"included\": true/false }"}
+                    }
+                }
+            )
+
+        # Load job result
+        result_data = result_store.get_result(job_id)
+
+        if not result_data:
+            logger.error(f"Result not found for job {job_id}")
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": {
+                        "code": "JOB_NOT_FOUND",
+                        "message": f"Job {job_id} not found",
+                        "details": {"job_id": job_id}
+                    }
+                }
+            )
+
+        # The result structure is flat - relationships are at top level
+        relationships = result_data.get("relationships", [])
+        logger.info(f"Found {len(relationships)} total relationships in job {job_id}")
+        found = False
+
+        for rel in relationships:
+            if rel.get("relationship_id") == relationship_id:
+                rel["excluded"] = not included
+                rel["updated_at"] = datetime.now().isoformat()
+                found = True
+                logger.info(f"Updated relationship {relationship_id} inclusion to {included}")
+                break
+
+        if not found:
+            # Log available relationship IDs for debugging
+            available_ids = [r.get("relationship_id") for r in relationships]
+            logger.error(f"Relationship {relationship_id} not found. Available IDs: {available_ids}")
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": {
+                        "code": "RELATIONSHIP_NOT_FOUND",
+                        "message": f"Relationship {relationship_id} not found in job {job_id}",
+                        "details": {
+                            "job_id": job_id,
+                            "relationship_id": relationship_id,
+                            "available_relationships": available_ids
+                        }
+                    }
+                }
+            )
+
+        # Update result in storage
+        result_store.update_result(job_id, result_data)
+
+        logger.info(f"Updated relationship {relationship_id} inclusion state in job {job_id} to {included}")
+
+        return {
+            "success": True,
+            "relationship_id": relationship_id,
+            "included": included,
+            "message": f"Relationship {'included' if included else 'excluded'} successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update relationship {relationship_id} inclusion in job {job_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "code": "UPDATE_RELATIONSHIP_FAILED",
+                    "message": "Failed to update relationship inclusion",
                     "details": str(e)
                 }
             }
