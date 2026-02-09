@@ -38,7 +38,7 @@ myenv/
 *.swo
 *~
 .DS_Store
-
+exports
 # Environment Variables
 .env
 .env.local

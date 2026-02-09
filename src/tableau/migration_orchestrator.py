@@ -27,6 +27,14 @@ from src.powerbi.model_enhancement_agent import ModelEnhancementAgent, Enhanceme
 from src.powerbi.enhancement_guide_generator import EnhancementGuideGenerator
 from workers.progress_manager import ProgressCallback
 
+# NEW: Complete migration components (STEPS 5-10)
+from src.powerbi.pbix_injector import PBIXInjector, Measure, Relationship
+from src.powerbi.model_builder import PowerBIModelBuilder, DateTableConfig
+from src.powerbi.table_calc_converter import TableCalculationConverter
+from src.powerbi.filter_parameter_converter import FilterParameterConverter
+from src.powerbi.template_creator import StarterPBIXCreator
+from src.powerbi.visual_converter import VisualConverter
+
 
 class MigrationOrchestrator:
     """
@@ -37,7 +45,13 @@ class MigrationOrchestrator:
     2. Profile Hyper data (30%)
     3. Build logic graph (45%)
     4. Generate DAX conversions (70%)
-    5. Validate conversions (85%)
+    5. Validate conversions & build complete model (85%)
+       - Validate DAX conversions
+       - Build data model (relationships, date table)
+       - Convert filters & parameters
+       - Create & inject PBIX
+       - Generate documentation
+       - Export table data to Excel
     6. Export Power BI artifacts (95%)
     7. Complete (100%)
     """
@@ -47,8 +61,16 @@ class MigrationOrchestrator:
         self.fidelity_store = FidelityValidationStore()
         self.dax_generator = DAXGenerator()
         self.validation_engine = ValidationEngine()
-        self.model_agent = ModelEnhancementAgent()  # NEW: Table calc agent
+        self.model_agent = ModelEnhancementAgent()  # Table calc agent
         self.model_enhancements: List[ModelEnhancement] = []  # Track all enhancements
+
+        # NEW: Complete migration components (STEPS 5-10)
+        self.pbix_injector = PBIXInjector()
+        self.model_builder = PowerBIModelBuilder()
+        self.table_calc_converter = TableCalculationConverter()
+        self.filter_converter = FilterParameterConverter()
+        self.template_creator = StarterPBIXCreator()
+        self.visual_converter = VisualConverter()
 
     async def execute_migration(
         self,
@@ -108,7 +130,7 @@ class MigrationOrchestrator:
                 progress_callback
             )
 
-            # Phase 5: Validate Conversions
+            # Phase 5: Validate Conversions & Build Complete Model
             validation_results = await self._validate_conversions(
                 migration_id,
                 conversions,
@@ -575,12 +597,17 @@ class MigrationOrchestrator:
         progress_callback: Optional[ProgressCallback]
     ) -> Dict[str, Any]:
         """
-        Validate DAX conversions against Tableau truth using 100% fidelity validation
+        Validate DAX conversions and build complete Power BI model
 
-        Returns:
-            Validation summary
+        Phase 5 includes:
+        - 100% fidelity validation (75-80%)
+        - Build data model (80-82%)
+        - Convert filters & parameters (82-84%)
+        - Create & inject PBIX (84-88%)
+        - Export table data to Excel (88-90%)
+        - Generate documentation (90-95%)
         """
-        logger.info("Phase 5: Validating conversions with 100% fidelity...")
+        logger.info("Phase 5: Validating conversions & building complete model...")
 
         self._update_progress(
             migration_id,
@@ -737,11 +764,454 @@ class MigrationOrchestrator:
 
         logger.info(f"✅ Validation complete: {perfect_matches}/{validated_count} perfect matches (avg {avg_pass_rate:.1%})")
 
+        # ============================================
+        # Build Complete Power BI Model (Part of Phase 5)
+        # ============================================
+
+        logger.info("=" * 60)
+        logger.info("🏗️  PHASE 5: Building Complete Power BI Model")
+        logger.info("=" * 60)
+
+        # Step 1: Build data model
+        self._update_progress(
+            migration_id,
+            MigrationStatus.VALIDATING,
+            80,
+            "Building Power BI data model...",
+            progress_callback
+        )
+
+        logger.info("Step 1/5: Building data model...")
+        try:
+            relationships = self._build_data_model(migration_id, workbooks_data, progress_callback)
+            logger.info(f"✅ Data model built: {len(relationships)} relationships")
+        except Exception as e:
+            logger.error(f"❌ Failed to build data model: {e}", exc_info=True)
+            relationships = []
+
+        # Step 2: Convert filters & parameters
+        self._update_progress(
+            migration_id,
+            MigrationStatus.VALIDATING,
+            82,
+            "Converting filters and parameters...",
+            progress_callback
+        )
+
+        logger.info("Step 2/5: Converting filters & parameters...")
+        try:
+            filter_param_results = self._convert_filters_parameters(migration_id, workbooks_data, progress_callback)
+            logger.info(f"✅ Filters converted: {len(filter_param_results.get('filters', []))} filters")
+        except Exception as e:
+            logger.error(f"❌ Failed to convert filters: {e}", exc_info=True)
+            filter_param_results = {"filters": [], "whatif_parameters": [], "slicer_tables": []}
+
+        # Step 3: Create & inject PBIX
+        self._update_progress(
+            migration_id,
+            MigrationStatus.VALIDATING,
+            84,
+            "Creating Power BI file...",
+            progress_callback
+        )
+
+        logger.info("Step 3/5: Creating & injecting PBIX...")
+        try:
+            pbix_path = self._create_and_inject_pbix(
+                migration_id,
+                conversions,
+                relationships,
+                filter_param_results,
+                workbooks_data,
+                progress_callback
+            )
+            if pbix_path:
+                logger.info(f"✅ PBIX created: {pbix_path}")
+            else:
+                logger.warning("⚠️  PBIX creation skipped (fallback to DAX file)")
+        except Exception as e:
+            logger.error(f"❌ Failed to create PBIX: {e}", exc_info=True)
+            pbix_path = None
+
+        # Step 4: Export table data to Excel
+        self._update_progress(
+            migration_id,
+            MigrationStatus.VALIDATING,
+            88,
+            "Exporting table data to Excel...",
+            progress_callback
+        )
+
+        logger.info("Step 4/5: Exporting table data to Excel...")
+        try:
+            excel_files = self._export_table_data_to_excel(
+                migration_id,
+                workbooks_data,
+                progress_callback
+            )
+            logger.info(f"✅ Table data exported: {len(excel_files)} files")
+        except Exception as e:
+            logger.error(f"❌ Failed to export table data: {e}", exc_info=True)
+            excel_files = []
+
+        # Step 5: Generate documentation (without suggestions)
+        self._update_progress(
+            migration_id,
+            MigrationStatus.VALIDATING,
+            90,
+            "Generating documentation...",
+            progress_callback
+        )
+
+        logger.info("Step 5/5: Generating documentation...")
+        try:
+            self._generate_migration_documentation(
+                migration_id,
+                workbooks_data,
+                filter_param_results,
+                Path("exports") / migration_id
+            )
+            logger.info("✅ Documentation generated")
+        except Exception as e:
+            logger.error(f"❌ Failed to generate documentation: {e}", exc_info=True)
+
+        logger.info("=" * 60)
+        logger.info("✅ PHASE 5 COMPLETE")
+        logger.info("=" * 60)
+
         return {
             "validated_count": validated_count,
             "perfect_matches": perfect_matches,
-            "avg_pass_rate": avg_pass_rate
+            "avg_pass_rate": avg_pass_rate,
+            "pbix_path": str(pbix_path) if pbix_path else None,
+            "excel_files": excel_files,
+            "relationships_count": len(relationships)
         }
+
+    # ============================================
+    # Phase 6: Build Data Model (NEW)
+    # ============================================
+
+    def _build_data_model(
+        self,
+        migration_id: str,
+        workbooks_data: List[Dict[str, Any]],
+        progress_callback: Optional[ProgressCallback]
+    ) -> List[Relationship]:
+        """Build Power BI data model (relationships, date table)"""
+
+        logger.info("Phase 6: Building Power BI data model...")
+
+        # Collect all data sources
+        all_data_sources = []
+        for wb in workbooks_data:
+            all_data_sources.extend(wb.get("data_sources", []))
+
+        # Build relationships
+        relationships = self.model_builder.build_relationships_from_tableau(
+            data_sources=all_data_sources
+        )
+
+        # Optimize relationships
+        relationships = self.model_builder.optimize_model_relationships(relationships)
+
+        logger.info(f"Built {len(relationships)} relationships")
+
+        return relationships
+
+    # ============================================
+    # Phase 7: Convert Filters & Parameters (NEW)
+    # ============================================
+
+    def _convert_filters_parameters(
+        self,
+        migration_id: str,
+        workbooks_data: List[Dict[str, Any]],
+        progress_callback: Optional[ProgressCallback]
+    ) -> Dict[str, Any]:
+        """Convert Tableau filters and parameters to Power BI"""
+
+        logger.info("Phase 7: Converting filters and parameters...")
+
+        # Collect all filters and parameters
+        all_filters = []
+        all_parameters = []
+        all_worksheets = []
+
+        for wb in workbooks_data:
+            # Collect worksheets
+            all_worksheets.extend(wb.get("worksheets", []))
+
+            # Get filters from parser
+            parser = wb.get("parser")
+            if parser:
+                filters = parser.parse_filters()
+                all_filters.extend(filters)
+
+            all_parameters.extend(wb.get("parameters", []))
+
+        # Convert filters
+        powerbi_filters = self.filter_converter.convert_filters(
+            all_filters,
+            worksheets=[ws.name for ws in all_worksheets]
+        )
+
+        # Convert parameters
+        param_conversion = self.filter_converter.convert_parameters(all_parameters)
+
+        logger.info(
+            f"Converted {len(powerbi_filters)} filters, "
+            f"{len(param_conversion['whatif_parameters'])} parameters"
+        )
+
+        return {
+            "filters": powerbi_filters,
+            "whatif_parameters": param_conversion["whatif_parameters"],
+            "slicer_tables": param_conversion["slicer_tables"]
+        }
+
+    # ============================================
+    # Phase 8: Create & Inject PBIX (NEW)
+    # ============================================
+
+    def _create_and_inject_pbix(
+        self,
+        migration_id: str,
+        conversions: List[Dict[str, Any]],
+        relationships: List[Relationship],
+        filter_param_results: Dict[str, Any],
+        workbooks_data: List[Dict[str, Any]],
+        progress_callback: Optional[ProgressCallback]
+    ) -> Optional[Path]:
+        """Create PBIX file with DAX measures (using Tabular Editor from scratch)"""
+
+        logger.info("Phase 8: Creating PBIX with measures...")
+
+        export_dir = Path("exports") / migration_id
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        # Collect all measures from conversions
+        measures = []
+
+        for conv in conversions:
+            dax_result = conv.get("dax_result")
+
+            if dax_result:
+                measure = Measure(
+                    name=conv.get("calc_name", "Measure"),
+                    expression=dax_result.dax_formula,
+                    display_folder="Migrated from Tableau",
+                    description=f"Converted from Tableau calculation"
+                )
+                measures.append(measure)
+
+        logger.info(f"✓ Prepared {len(measures)} measures for PBIX creation")
+
+        # Try to create PBIX using Tabular Editor (new approach - from scratch)
+        if self.pbix_injector.tabular_editor_path:
+            try:
+                output_pbix = export_dir / "migrated_model.pbix"
+
+                # Create PBIX from scratch (bypasses template parsing issue)
+                self.pbix_injector.create_pbix_from_scratch(
+                    output_path=str(output_pbix),
+                    measures=measures,
+                    relationships=relationships
+                )
+
+                logger.info(f"✅ PBIX created: {output_pbix}")
+                logger.info(f"   → {len(measures)} measures added")
+                logger.info(f"   → {len(relationships)} relationships created")
+
+                return output_pbix
+
+            except Exception as e:
+                logger.error(f"PBIX creation failed: {e}")
+                logger.warning("Falling back to DAX file export...")
+
+                # Fallback: Export to .dax file
+                self._export_dax_fallback(measures, export_dir)
+
+                return None
+        else:
+            logger.warning("Tabular Editor not found - PBIX creation skipped")
+            logger.info("Download from: https://github.com/TabularEditor/TabularEditor/releases")
+
+            # Fallback: Export to .dax file
+            self._export_dax_fallback(measures, export_dir)
+
+            return None
+
+    def _export_dax_fallback(
+        self,
+        measures: List[Measure],
+        export_dir: Path
+    ):
+        """Export DAX measures to .dax file as fallback"""
+
+        dax_file = export_dir / "measures.dax"
+
+        with open(dax_file, 'w', encoding='utf-8') as f:
+            f.write("/* ============================================\n")
+            f.write("   POWER BI DAX MEASURES\n")
+            f.write("   Generated from Tableau Migration\n")
+            f.write(f"   Generated: {datetime.now().isoformat()}\n")
+            f.write("   ============================================ */\n\n")
+
+            for measure in measures:
+                f.write(f"-- {measure.name}\n")
+                if measure.description:
+                    f.write(f"-- {measure.description}\n")
+                f.write(f"{measure.name} = {measure.expression}\n\n")
+
+        logger.info(f"✓ Exported {len(measures)} measures to: {dax_file}")
+
+    def _generate_migration_documentation(
+        self,
+        migration_id: str,
+        workbooks_data: List[Dict[str, Any]],
+        filter_param_results: Dict[str, Any],
+        export_dir: Path
+    ):
+        """Generate migration documentation reports"""
+
+        logger.info("Generating migration documentation...")
+
+        try:
+            # Collect all worksheets
+            all_worksheets = []
+            all_filters = []
+            all_parameters = []
+
+            for wb in workbooks_data:
+                all_worksheets.extend(wb.get("worksheets", []))
+                all_parameters.extend(wb.get("parameters", []))
+
+                # Get filters from parser
+                parser = wb.get("parser")
+                if parser:
+                    filters = parser.parse_filters()
+                    all_filters.extend(filters)
+
+            # Filter/parameter conversion report
+            try:
+                filter_report = self.filter_converter.generate_conversion_report(
+                    tableau_filters=all_filters,
+                    tableau_parameters=all_parameters,
+                    powerbi_filters=filter_param_results.get("filters", []),
+                    whatif_parameters=filter_param_results.get("whatif_parameters", []),
+                    slicer_tables=filter_param_results.get("slicer_tables", [])
+                )
+
+                filter_report_path = export_dir / "filter_parameter_conversion.md"
+
+                with open(filter_report_path, 'w', encoding='utf-8') as f:
+                    f.write(filter_report)
+
+                logger.info(f"✓ Filter/parameter report: {filter_report_path}")
+            except Exception as e:
+                logger.error(f"Failed to generate filter/parameter report: {e}")
+
+            # Visual conversion report
+            try:
+                powerbi_visuals = self.visual_converter.convert_worksheets_to_visuals(
+                    worksheets=all_worksheets,
+                    auto_layout=True
+                )
+
+                visual_report = self.visual_converter.generate_visual_conversion_report(
+                    worksheets=all_worksheets,
+                    visuals=powerbi_visuals
+                )
+
+                visual_report_path = export_dir / "visual_conversion.md"
+
+                with open(visual_report_path, 'w', encoding='utf-8') as f:
+                    f.write(visual_report)
+
+                logger.info(f"✓ Visual conversion report: {visual_report_path}")
+            except Exception as e:
+                logger.error(f"Failed to generate visual conversion report: {e}")
+
+        except Exception as e:
+            logger.error(f"Failed to generate documentation: {e}")
+            # Don't fail the entire migration if documentation generation fails
+
+    def _export_table_data_to_excel(
+        self,
+        migration_id: str,
+        workbooks_data: List[Dict[str, Any]],
+        progress_callback: Optional[ProgressCallback]
+    ) -> List[str]:
+        """Export all table data from Hyper files to Excel"""
+
+        logger.info("Exporting table data to Excel...")
+
+        export_dir = Path("exports") / migration_id / "table_data"
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        excel_files = []
+
+        # Collect all Hyper files
+        all_hyper_files = []
+        for wb in workbooks_data:
+            all_hyper_files.extend(wb.get("hyper_files", []))
+
+        if not all_hyper_files:
+            logger.warning("No Hyper files found - skipping table data export")
+            return excel_files
+
+        try:
+            import pandas as pd
+            from src.tableau.hyper_profiler import HyperDataProfiler
+
+            # Use HyperDataProfiler which handles Hyper API correctly
+            for hyper_path in all_hyper_files:
+                try:
+                    logger.info(f"Processing Hyper file: {Path(hyper_path).name}")
+                    profiler = HyperDataProfiler(str(hyper_path))
+
+                    # Get all tables
+                    tables = profiler.list_tables()
+                    logger.info(f"Found {len(tables)} tables in Hyper file")
+
+                    for table_name in tables:
+                        try:
+                            # Remove quotes from table name for read_table() method
+                            # list_tables() returns: "Extract"."TableName"
+                            # read_table() expects: Extract.TableName
+                            unquoted_table = table_name.replace('"', '')
+
+                            # Read table data
+                            df = profiler.read_table(unquoted_table)
+
+                            if df is not None and len(df) > 0:
+                                # Clean table name for filename (remove schema prefix and special chars)
+                                clean_name = table_name.replace('"', '').replace('.', '_').replace('!', '_')
+                                excel_filename = f"{clean_name}.xlsx"
+                                excel_path = export_dir / excel_filename
+
+                                # Save to Excel
+                                df.to_excel(excel_path, index=False, engine='openpyxl')
+
+                                excel_files.append(str(excel_path))
+                                logger.info(f"✓ Exported {len(df)} rows from {table_name} to {excel_filename}")
+                            else:
+                                logger.warning(f"Table {table_name} is empty, skipping export")
+
+                        except Exception as e:
+                            logger.warning(f"Failed to export table {table_name}: {e}")
+
+                except Exception as e:
+                    logger.error(f"Failed to process Hyper file {hyper_path}: {e}")
+
+        except ImportError as e:
+            logger.warning(f"Required libraries not available for Excel export: {e}")
+            logger.info("Install with: pip install pandas openpyxl")
+
+        logger.info(f"✓ Exported {len(excel_files)} tables to Excel")
+
+        return excel_files
 
     # ============================================
     # Utility Methods

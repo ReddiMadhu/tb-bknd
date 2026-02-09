@@ -1673,14 +1673,16 @@ async def get_recommendations(migration_id: str):
 @router.get("/{migration_id}/download-all")
 async def download_all_artifacts(migration_id: str):
     """
-    Download complete migration package for Page 5 - Recommendations
+    Download complete migration package
 
     Includes:
+    - PBIX file (if generated)
     - DAX measures file (.dax)
     - Excel conversion report
-    - Relationship mappings (JSON)
-    - Recommendations report (Markdown)
-    - Model enhancement guide (if applicable)
+    - Table data (Excel files)
+    - Filter/parameter conversion report
+    - Visual conversion report
+    - Migration metadata (JSON)
 
     Returns:
         ZIP file download
@@ -1700,26 +1702,62 @@ async def download_all_artifacts(migration_id: str):
                 json.dumps(migration.to_dict(), indent=2, default=str)
             )
 
-            # 2. DAX measures file
+            export_dir = Path("exports") / migration_id
+
+            # Log export directory status
+            logger.info(f"📁 Export directory: {export_dir.absolute()}")
+            logger.info(f"📁 Directory exists: {export_dir.exists()}")
+
+            if export_dir.exists():
+                files_in_dir = list(export_dir.rglob("*"))
+                logger.info(f"📂 Files in export directory: {len(files_in_dir)}")
+                for f in files_in_dir[:10]:  # Log first 10 files
+                    logger.info(f"   - {f.relative_to(export_dir)}")
+            else:
+                logger.warning(f"⚠️  Export directory does not exist: {export_dir}")
+
+            # 2. PBIX file (if exists)
+            pbix_path = export_dir / "migrated_model.pbix"
+            logger.info(f"🔍 Checking for PBIX: {pbix_path}")
+            if pbix_path.exists():
+                zip_file.write(pbix_path, "migrated_model.pbix")
+                logger.info("✅ Added PBIX file to package")
+            else:
+                logger.warning("⚠️  PBIX file not found, skipping")
+
+            # 3. DAX measures file
+            dax_path = export_dir / "measures.dax"
+            logger.info(f"🔍 Checking for DAX file: {dax_path}")
+            if dax_path.exists():
+                with open(dax_path, 'r', encoding='utf-8') as f:
+                    zip_file.writestr("dax_measures.dax", f.read())
+                logger.info("✅ Added DAX measures from file")
+            else:
+                logger.info("⚠️  DAX file not found, generating from database")
+                # Fallback: generate from conversions
+                conversions = migration_store.get_conversions_by_migration(migration_id)
+                calculations = migration_store.get_calculations_by_migration(migration_id)
+                calc_map = {c.calc_id: c for c in calculations}
+
+                dax_content = "-- DAX Measures Export\n"
+                dax_content += f"-- Generated: {datetime.now().isoformat()}\n"
+                dax_content += f"-- Migration ID: {migration_id}\n\n"
+
+                for conv in conversions:
+                    calc = calc_map.get(conv.calc_id)
+                    if calc:
+                        dax_content += f"-- Measure: {calc.calc_name}\n"
+                        dax_content += f"-- Original Tableau: {calc.calc_formula}\n"
+                        dax_content += f"-- Confidence: {conv.confidence_score * 100:.0f}%\n"
+                        dax_content += f"{conv.dax_formula}\n\n"
+
+                zip_file.writestr("dax_measures.dax", dax_content)
+
+            # 4. Excel conversion report
             conversions = migration_store.get_conversions_by_migration(migration_id)
             calculations = migration_store.get_calculations_by_migration(migration_id)
             calc_map = {c.calc_id: c for c in calculations}
 
-            dax_content = "-- DAX Measures Export\n"
-            dax_content += f"-- Generated: {datetime.now().isoformat()}\n"
-            dax_content += f"-- Migration ID: {migration_id}\n\n"
-
-            for conv in conversions:
-                calc = calc_map.get(conv.calc_id)
-                if calc:
-                    dax_content += f"-- Measure: {calc.calc_name}\n"
-                    dax_content += f"-- Original Tableau: {calc.calc_formula}\n"
-                    dax_content += f"-- Confidence: {conv.confidence_score * 100:.0f}%\n"
-                    dax_content += f"{conv.dax_formula}\n\n"
-
-            zip_file.writestr("dax_measures.dax", dax_content)
-
-            # 3. Excel conversion report
             report_data = []
             for conv in conversions:
                 calc = calc_map.get(conv.calc_id)
@@ -1742,41 +1780,71 @@ async def download_all_artifacts(migration_id: str):
 
             zip_file.writestr("conversion_report.xlsx", excel_buffer.getvalue())
 
-            # 4. Recommendations report
-            recommendations_md = f"# Power BI Migration Recommendations\n\n"
-            recommendations_md += f"**Migration ID:** {migration_id}\n"
-            recommendations_md += f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            recommendations_md += f"## Success Rate\n\n"
+            # 5. Table data Excel files (NEW)
+            table_data_dir = export_dir / "table_data"
+            logger.info(f"🔍 Checking for table data: {table_data_dir}")
+            if table_data_dir.exists():
+                excel_files = list(table_data_dir.glob("*.xlsx"))
+                logger.info(f"📊 Found {len(excel_files)} Excel files")
+                for excel_file in excel_files:
+                    zip_file.write(excel_file, f"table_data/{excel_file.name}")
+                    logger.info(f"✅ Added table data: {excel_file.name}")
+            else:
+                logger.warning("⚠️  Table data directory not found")
 
-            auto = sum(1 for c in conversions if c.confidence_score >= 0.9)
-            manual = sum(1 for c in conversions if 0.7 <= c.confidence_score < 0.9)
-            total = len(conversions)
-            rate = (auto / total * 100) if total > 0 else 0
+            # 6. Filter/parameter conversion report
+            filter_report_path = export_dir / "filter_parameter_conversion.md"
+            logger.info(f"🔍 Checking for filter report: {filter_report_path}")
+            if filter_report_path.exists():
+                with open(filter_report_path, 'r', encoding='utf-8') as f:
+                    zip_file.writestr("filter_parameter_conversion.md", f.read())
+                logger.info("✅ Added filter/parameter report")
+            else:
+                logger.warning("⚠️  Filter/parameter report not found")
 
-            recommendations_md += f"- **Overall Success Rate:** {rate:.1f}%\n"
-            recommendations_md += f"- **Auto-Converted:** {auto}\n"
-            recommendations_md += f"- **Manual Review:** {manual}\n"
-            recommendations_md += f"- **Total Calculations:** {total}\n\n"
+            # 7. Visual conversion report
+            visual_report_path = export_dir / "visual_conversion.md"
+            logger.info(f"🔍 Checking for visual report: {visual_report_path}")
+            if visual_report_path.exists():
+                with open(visual_report_path, 'r', encoding='utf-8') as f:
+                    zip_file.writestr("visual_conversion.md", f.read())
+                logger.info("✅ Added visual conversion report")
+            else:
+                logger.warning("⚠️  Visual conversion report not found")
 
-            zip_file.writestr("RECOMMENDATIONS.md", recommendations_md)
+            # NOTE: Enhancement guide and recommendations are NOT included (removed as per requirements)
 
-            # 5. README
+            # 8. README
             readme = f"# Tableau to Power BI Migration Package\n\n"
             readme += f"**Migration ID:** {migration_id}\n"
             readme += f"**Status:** {migration.status.value}\n"
             readme += f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             readme += "## Contents\n\n"
-            readme += "- `migration_metadata.json` - Migration job metadata\n"
+            readme += "### Core Files\n"
+            readme += "- `migrated_model.pbix` - Ready-to-use Power BI file (if generated)\n"
             readme += "- `dax_measures.dax` - All DAX measure definitions\n"
+            readme += "- `migration_metadata.json` - Migration job metadata\n\n"
+            readme += "### Reports & Documentation\n"
             readme += "- `conversion_report.xlsx` - Detailed conversion report\n"
-            readme += "- `RECOMMENDATIONS.md` - Strategic recommendations\n\n"
+            readme += "- `filter_parameter_conversion.md` - Filter & parameter mappings\n"
+            readme += "- `visual_conversion.md` - Visual conversion details\n\n"
+            readme += "### Table Data\n"
+            readme += "- `table_data/` - Exported table data as Excel files\n\n"
             readme += "## Next Steps\n\n"
-            readme += "1. Review the conversion report\n"
-            readme += "2. Import DAX measures into Power BI\n"
-            readme += "3. Set up data model relationships\n"
-            readme += "4. Validate results against Tableau\n"
+            readme += "1. Open `migrated_model.pbix` in Power BI Desktop\n"
+            readme += "2. Review `conversion_report.xlsx` for conversion details\n"
+            readme += "3. Check `filter_parameter_conversion.md` for filter setup\n"
+            readme += "4. Use table data files to load data into Power BI\n"
+            readme += "5. Validate results against original Tableau workbook\n"
 
             zip_file.writestr("README.md", readme)
+
+            logger.info("=" * 60)
+            logger.info("📦 ZIP PACKAGE SUMMARY:")
+            logger.info(f"   Total files in ZIP: {len(zip_file.namelist())}")
+            for name in zip_file.namelist():
+                logger.info(f"   ✓ {name}")
+            logger.info("=" * 60)
 
         zip_buffer.seek(0)
 
@@ -1789,6 +1857,201 @@ async def download_all_artifacts(migration_id: str):
     except Exception as e:
         logger.error(f"Failed to create migration package: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================
+# Complete Migration with PBIX Generation (NEW)
+# ============================================
+
+@router.post("/migrate/complete")
+async def create_complete_migration(
+    files: List[UploadFile] = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Execute complete end-to-end migration with PBIX generation
+
+    NEW: This endpoint includes all migration features (STEPS 1-10):
+    - Parse TWBX
+    - Extract & validate calculations
+    - Build data model (relationships, date table)
+    - Convert filters & parameters
+    - Convert table calculations
+    - Create PBIX file with Tabular Editor
+    - Generate documentation
+
+    Request:
+        - files: List of .twbx or .twb files
+
+    Response:
+        {
+            "migration_id": "mig_abc123",
+            "status": "processing",
+            "workbook_count": 1,
+            "message": "Complete migration started with PBIX generation",
+            "features": [
+                "DAX conversion",
+                "100% fidelity validation",
+                "Data model builder",
+                "Filter & parameter conversion",
+                "Table calculations",
+                "PBIX injection",
+                "Visual conversion"
+            ]
+        }
+    """
+    try:
+        # Validate files
+        for file in files:
+            if not file.filename.endswith(('.twbx', '.twb')):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid file type: {file.filename}. Only .twbx and .twb files are supported."
+                )
+
+        # Create migration ID
+        migration_id = f"mig_{uuid.uuid4().hex[:12]}"
+
+        # Create migration job
+        migration = migration_store.create_migration(migration_id)
+
+        # Save uploaded files
+        file_paths = []
+        for file in files:
+            stored_path = Path(config.UPLOAD_DIR) / f"{migration_id}_{file.filename}"
+
+            with open(stored_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
+
+            file_paths.append(str(stored_path))
+            logger.info(f"Saved file for complete migration: {file.filename} ({len(content)} bytes)")
+
+        # Update migration with file count
+        migration_store.update_migration_counts(
+            migration_id,
+            workbook_count=len(files)
+        )
+
+        # Trigger complete migration in background
+        background_tasks.add_task(orchestrator.execute_migration, migration_id, file_paths)
+        logger.info(f"✨ Started COMPLETE migration (with PBIX) for {migration_id}")
+
+        return {
+            "migration_id": migration_id,
+            "status": "processing",
+            "workbook_count": len(files),
+            "message": "Complete migration started with PBIX generation",
+            "features": [
+                "DAX conversion with AI",
+                "100% fidelity validation",
+                "Data model builder (relationships, date table)",
+                "Filter & parameter conversion",
+                "Table calculations (running totals, rank, etc.)",
+                "PBIX file injection via Tabular Editor",
+                "Visual conversion with auto-layout",
+                "Complete documentation"
+            ],
+            "note": "Migration will generate a ready-to-use .pbix file if Tabular Editor is installed"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to start complete migration: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/migrate/complete/{migration_id}/artifacts")
+async def get_complete_migration_artifacts(migration_id: str):
+    """
+    Get all artifacts from complete migration
+
+    Returns:
+        {
+            "migration_id": "mig_abc123",
+            "pbix_file": "exports/mig_abc123/migrated_model.pbix",
+            "dax_file": "exports/mig_abc123/measures.dax",
+            "documentation": {
+                "filter_conversion": "exports/mig_abc123/filter_parameter_conversion.md",
+                "visual_conversion": "exports/mig_abc123/visual_conversion.md",
+                "enhancement_guide": "exports/mig_abc123/EnhancementGuide.md"
+            },
+            "status": "completed"
+        }
+    """
+    migration = migration_store.get_migration(migration_id)
+
+    if not migration:
+        raise HTTPException(status_code=404, detail="Migration not found")
+
+    export_dir = Path("exports") / migration_id
+
+    artifacts = {
+        "migration_id": migration_id,
+        "status": migration.status.value,
+        "pbix_file": None,
+        "dax_file": None,
+        "documentation": {}
+    }
+
+    # Check for PBIX file
+    pbix_path = export_dir / "migrated_model.pbix"
+    if pbix_path.exists():
+        artifacts["pbix_file"] = str(pbix_path)
+
+    # Check for DAX file (fallback)
+    dax_path = export_dir / "measures.dax"
+    if dax_path.exists():
+        artifacts["dax_file"] = str(dax_path)
+
+    # Check for documentation
+    filter_doc = export_dir / "filter_parameter_conversion.md"
+    if filter_doc.exists():
+        artifacts["documentation"]["filter_conversion"] = str(filter_doc)
+
+    visual_doc = export_dir / "visual_conversion.md"
+    if visual_doc.exists():
+        artifacts["documentation"]["visual_conversion"] = str(visual_doc)
+
+    enhancement_doc = export_dir / "EnhancementGuide.md"
+    if enhancement_doc.exists():
+        artifacts["documentation"]["enhancement_guide"] = str(enhancement_doc)
+
+    return artifacts
+
+
+@router.get("/migrate/complete/{migration_id}/download/{file_type}")
+async def download_migration_artifact(migration_id: str, file_type: str):
+    """
+    Download specific migration artifact
+
+    file_type: pbix, dax, filter_doc, visual_doc, enhancement_doc
+    """
+    export_dir = Path("exports") / migration_id
+
+    file_map = {
+        "pbix": export_dir / "migrated_model.pbix",
+        "dax": export_dir / "measures.dax",
+        "filter_doc": export_dir / "filter_parameter_conversion.md",
+        "visual_doc": export_dir / "visual_conversion.md",
+        "enhancement_doc": export_dir / "EnhancementGuide.md",
+        "template": export_dir / "template.pbix"
+    }
+
+    file_path = file_map.get(file_type)
+
+    if not file_path or not file_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Artifact '{file_type}' not found for migration {migration_id}"
+        )
+
+    return FileResponse(
+        path=file_path,
+        filename=file_path.name,
+        media_type="application/octet-stream"
+    )
 
 
 # ============================================
