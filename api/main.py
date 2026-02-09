@@ -13,7 +13,7 @@ from storage.database import init_database
 async def lifespan(app: FastAPI):
     """Lifespan events for FastAPI application"""
     # Startup
-    logger.info("Starting Excel Relationship Discovery API...")
+    logger.info("Starting BI Migration & Discovery API...")
 
     # Ensure directories exist
     config.ensure_directories()
@@ -54,8 +54,9 @@ app.add_middleware(
 async def root():
     """Root endpoint"""
     return {
-        "message": "Excel Relationship Discovery API",
+        "message": "BI Migration & Discovery API",
         "version": config.API_VERSION,
+        "features": ["Excel Relationship Discovery", "Tableau to Power BI Migration"],
         "docs": "/docs",
         "health": "/health"
     }
@@ -72,7 +73,7 @@ async def health_check():
 
 
 # Import and include routers
-from api.routers import jobs, websocket
+from api.routers import jobs, websocket, migration, workbook_metadata
 
 app.include_router(
     jobs.router,
@@ -84,6 +85,16 @@ app.include_router(
     websocket.router,
     prefix=f"{config.API_PREFIX}",
     tags=["websocket"]
+)
+
+app.include_router(
+    migration.router,
+    tags=["migration"]
+)
+
+app.include_router(
+    workbook_metadata.router,
+    tags=["workbook-metadata"]
 )
 
 

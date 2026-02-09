@@ -3,6 +3,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks,
 from typing import List, Optional
 from datetime import datetime
 from loguru import logger
+import json
 
 from api.models.api_models import (
     JobCreateResponse,
@@ -32,7 +33,7 @@ from storage.preview_store import PreviewStore
 from storage.database import get_db_connection
 
 # Import job executor (will create next)
-from workers.job_executor import execute_discovery_job
+from workers.job_executor import execute_discovery_job, execute_tableau_discovery_job
 
 router = APIRouter()
 
@@ -624,6 +625,16 @@ async def confirm_preview(
         # Load DataFrames
         dataframes = preview_store.load_all_dataframes(preview_id)
 
+        # Get preview files to check for Tableau source
+        preview_files = preview_store.get_preview_files(preview_id)
+        is_tableau_source = False
+        if preview_files:
+            # Check first file's metadata for Tableau source
+            first_file = preview_files[0]
+            if first_file.metadata_json:
+                metadata = json.loads(first_file.metadata_json)
+                is_tableau_source = metadata.get("source") == "tableau"
+
         # Apply column deletions
         columns_removed = 0
         file_paths = []
@@ -642,29 +653,43 @@ async def confirm_preview(
                 columns_removed += len(cols_to_drop)
                 logger.info(f"Dropped {len(cols_to_drop)} columns from {selection.file_id}")
 
-            # Save cleaned DataFrame to a temp file for processing
-            file_path = preview_store.get_file_path(selection.file_id)
-            if file_path:
-                # Overwrite original file with cleaned DataFrame
-                import pandas as pd
-                df.to_excel(file_path, index=False)
-                file_paths.append(file_path)
+            # Update dataframe in dict
+            dataframes[selection.file_id] = df
+
+            # For Excel workflow, save to file
+            if not is_tableau_source:
+                file_path = preview_store.get_file_path(selection.file_id)
+                if file_path:
+                    # Overwrite original file with cleaned DataFrame
+                    import pandas as pd
+                    df.to_excel(file_path, index=False)
+                    file_paths.append(file_path)
 
         # Generate job ID
         job_id = generate_job_id()
 
         # Create job in database
-        job = job_store.create_job(job_id=job_id, file_count=len(file_paths))
+        file_count = len(dataframes) if is_tableau_source else len(file_paths)
+        job = job_store.create_job(job_id=job_id, file_count=file_count)
 
         # Mark preview as confirmed
         preview_store.update_session_status(preview_id, "confirmed")
 
-        # Schedule background job with cleaned files
-        background_tasks.add_task(
-            execute_discovery_job,
-            job_id=job_id,
-            file_paths=file_paths
-        )
+        # Schedule background job based on source type
+        if is_tableau_source:
+            logger.info(f"Scheduling Tableau discovery job for {len(dataframes)} tables")
+            background_tasks.add_task(
+                execute_tableau_discovery_job,
+                job_id=job_id,
+                dataframes=dataframes
+            )
+        else:
+            logger.info(f"Scheduling Excel discovery job for {len(file_paths)} files")
+            background_tasks.add_task(
+                execute_discovery_job,
+                job_id=job_id,
+                file_paths=file_paths
+            )
 
         # Don't delete preview immediately - let background task handle cleanup
         # or let scheduled cleanup delete it after 1 hour
@@ -675,7 +700,7 @@ async def confirm_preview(
             job_id=job_id,
             status=JobStatus.RUNNING,
             created_at=datetime.utcnow(),
-            file_count=len(file_paths),
+            file_count=file_count,
             columns_removed=columns_removed,
             message="Job created successfully and processing started"
         )

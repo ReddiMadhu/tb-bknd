@@ -86,7 +86,29 @@ class LLMReasoner:
         except Exception as e:
             logger.error(f"LLM validation failed: {e}")
             return self._get_fallback_result(f"Error: {str(e)}")
-    
+
+    def reason(self, prompt: str) -> str:
+        """
+        Generic reasoning method for DAX generation and other tasks.
+
+        Args:
+            prompt: The prompt to send to the LLM
+
+        Returns:
+            String response from the LLM
+        """
+        if not Config.ENABLE_LLM_VALIDATION or not self.llm:
+            raise Exception("LLM not available - check Azure OpenAI configuration")
+
+        try:
+            # Call LLM via LangChain
+            response = self.llm.invoke(prompt)
+            return response.content
+
+        except Exception as e:
+            logger.error(f"LLM reasoning failed: {e}")
+            raise
+
     def _build_validation_prompt(self, candidate: Dict[str, Any]) -> str:
         """Build structured prompt for relationship validation."""
         
