@@ -236,21 +236,24 @@ class PreviewStore:
             preview_id: Preview session identifier
 
         Returns:
-            Dict mapping file_id to DataFrame
+            Dict mapping file_id_original_filename to DataFrame
         """
         dataframes = {}
 
         with get_db_connection() as conn:
             rows = conn.execute(
-                "SELECT file_id, dataframe_pickle_path FROM preview_files WHERE preview_id = ?",
+                "SELECT file_id, original_filename, dataframe_pickle_path FROM preview_files WHERE preview_id = ?",
                 (preview_id,)
             ).fetchall()
 
         for row in rows:
             file_id = row["file_id"]
+            original_filename = row["original_filename"]
             df = self.load_dataframe(file_id)
             if df is not None:
-                dataframes[file_id] = df
+                # Use file_id_original_filename as key to match stored file pattern
+                dict_key = f"{file_id}_{original_filename}"
+                dataframes[dict_key] = df
 
         logger.info(f"Loaded {len(dataframes)} DataFrames for preview {preview_id}")
         return dataframes

@@ -628,6 +628,10 @@ async def confirm_preview(
         # Get preview files to check for Tableau source
         preview_files = preview_store.get_preview_files(preview_id)
         is_tableau_source = False
+
+        # Create mapping from file_id to full dict key (file_id_original_filename)
+        file_id_to_dict_key = {}
+
         if preview_files:
             # Check first file's metadata for Tableau source
             first_file = preview_files[0]
@@ -635,16 +639,23 @@ async def confirm_preview(
                 metadata = json.loads(first_file.metadata_json)
                 is_tableau_source = metadata.get("source") == "tableau"
 
+            # Build mapping
+            for pf in preview_files:
+                dict_key = f"{pf.file_id}_{pf.original_filename}"
+                file_id_to_dict_key[pf.file_id] = dict_key
+
         # Apply column deletions
         columns_removed = 0
         file_paths = []
 
         for selection in request.file_selections:
-            if selection.file_id not in dataframes:
+            # Map file_id to dict key
+            dict_key = file_id_to_dict_key.get(selection.file_id)
+            if not dict_key or dict_key not in dataframes:
                 logger.warning(f"File {selection.file_id} not found in preview")
                 continue
 
-            df = dataframes[selection.file_id]
+            df = dataframes[dict_key]
 
             # Drop selected columns
             if selection.columns_to_delete:
@@ -653,8 +664,8 @@ async def confirm_preview(
                 columns_removed += len(cols_to_drop)
                 logger.info(f"Dropped {len(cols_to_drop)} columns from {selection.file_id}")
 
-            # Update dataframe in dict
-            dataframes[selection.file_id] = df
+            # Update dataframe in dict using the full key
+            dataframes[dict_key] = df
 
             # For Excel workflow, save to file
             if not is_tableau_source:
