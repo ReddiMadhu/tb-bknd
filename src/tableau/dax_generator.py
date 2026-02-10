@@ -80,6 +80,45 @@ class DAXGenerator:
 
         return llm_result
 
+    def _detect_calculation_type(self, tableau_formula: str, calc_type: str) -> str:
+        """
+        Detect if calculation should be a Measure or Calculated Column
+
+        Args:
+            tableau_formula: Tableau formula to analyze
+            calc_type: Tableau calc type (measure, dimension)
+
+        Returns:
+            "MEASURE" or "CALCULATED_COLUMN"
+        """
+        # Check for aggregation functions
+        agg_functions = ['SUM', 'AVG', 'COUNT', 'MIN', 'MAX', 'STDEV', 'VAR', 'TOTAL', 'COUNTD']
+        has_aggregation = any(func in tableau_formula.upper() for func in agg_functions)
+
+        if has_aggregation:
+            return "MEASURE"
+
+        # Dimension calc_type usually means calculated column
+        if calc_type.lower() == 'dimension':
+            return "CALCULATED_COLUMN"
+
+        # Check for pure field references with arithmetic (no functions)
+        # Pattern: [Field1] operator [Field2]
+        simple_arithmetic = re.search(
+            r'^\[[\w\s\.\-_]+\]\s*[\+\-\*/]\s*\[[\w\s\.\-_]+\]$',
+            tableau_formula.strip(),
+            re.IGNORECASE
+        )
+        if simple_arithmetic:
+            return "CALCULATED_COLUMN"
+
+        # Check for IF statements without aggregations (row-level logic)
+        if 'IF ' in tableau_formula.upper() and not has_aggregation:
+            return "CALCULATED_COLUMN"
+
+        # Default to measure (safer for ambiguous cases)
+        return "MEASURE"
+
     def _find_exact_pattern_match(self, tableau_formula: str) -> Optional[ConversionPattern]:
         """Find exact pattern match by formula similarity"""
         best_match = self.pattern_loader.find_best_match(
@@ -189,119 +228,195 @@ class DAXGenerator:
     ) -> str:
         """Build the LLM prompt for DAX generation with full visual context"""
 
+        # NEW: Detect calculation type (Measure vs Calculated Column)
+        dax_type = self._detect_calculation_type(tableau_formula, calc_type)
+
         # Interpret visual types for LLM
         visual_types = visual_context.get('visual_types', [])
         visual_hint = self._get_visual_context_hint(visual_types, visual_context)
 
-        # NEW: Context transition guidance (Component 2)
+        # NEW: Context transition guidance
         context_transition = visual_context.get('context_transition')
         context_transition_hint = self._get_context_transition_hint(context_transition)
 
-        prompt = f"""You are a Principal BI Engineer specializing in Tableau-to-Power BI migrations.
+        # Build few-shot examples based on type
+        if dax_type == "CALCULATED_COLUMN":
+            examples = """
+<example>
+<tableau>IF [Status] = "Active" THEN [Amount] END</tableau>
+<reasoning>
+1. This is row-level logic (IF without aggregation)
+2. Should create a calculated column, not a measure
+3. Need to handle NULL case (ELSE missing in Tableau)
+4. Use BLANK() for NULL in DAX
+</reasoning>
+<dax>Active Amount = IF(Sales[Status] = "Active", Sales[Amount], BLANK())</dax>
+</example>
 
-Your task: Convert the following Tableau calculation to optimized Power BI DAX.
+<example>
+<tableau>[Field A] + [Field B]</tableau>
+<reasoning>
+1. Simple arithmetic on two fields
+2. No aggregation - evaluates per row
+3. Must be calculated column
+4. NO SUM() wrappers needed
+</reasoning>
+<dax>Total Fields = Sales[Field A] + Sales[Field B]</dax>
+</example>
 
-## TABLEAU CALCULATION
+<example>
+<tableau>IF [Category]="Electronics" THEN 0.1 ELSE 0.05 END</tableau>
+<reasoning>
+1. Row-level conditional logic
+2. Returns scalar value per row
+3. Calculated column syntax
+4. Both branches defined (no BLANK needed)
+</reasoning>
+<dax>Discount Rate = IF(Sales[Category] = "Electronics", 0.1, 0.05)</dax>
+</example>
+"""
+        else:
+            examples = """
+<example>
+<tableau>SUM([Revenue]) / SUM([Quantity])</tableau>
+<reasoning>
+1. Division of two aggregations
+2. Must use DIVIDE to avoid divide-by-zero
+3. Measure (aggregates data)
+4. Provide 0 as default for division errors
+</reasoning>
+<dax>Average Price = DIVIDE(SUM(Sales[Revenue]), SUM(Sales[Quantity]), 0)</dax>
+</example>
 
-**Name:** {calc_name}
-**Type:** {calc_type}
-**Formula:**
-```tableau
-{tableau_formula}
-```
+<example>
+<tableau>{FIXED [Region] : SUM([Sales])}</tableau>
+<reasoning>
+1. FIXED LOD - ignores visual filters
+2. Use CALCULATE with ALLEXCEPT to remove filter context
+3. Keep Region filter, remove all others
+4. Returns aggregated value per Region
+</reasoning>
+<dax>Regional Sales = CALCULATE(SUM(Sales[Sales]), ALLEXCEPT(Sales, Sales[Region]))</dax>
+</example>
 
-## VISUAL CONTEXT (CRITICAL FOR DAX GENERATION)
+<example>
+<tableau>SUM([Sales A]) + SUM([Sales B])</tableau>
+<reasoning>
+1. Arithmetic on two aggregations
+2. Both must be wrapped in SUM
+3. Measure that combines two metrics
+4. Simple addition after aggregation
+</reasoning>
+<dax>Total Sales = SUM(Sales[Sales A]) + SUM(Sales[Sales B])</dax>
+</example>
+"""
 
-{visual_hint}
+        prompt = f"""<system>
+You are an expert Power BI consultant specializing in converting Tableau calculations to DAX.
+You have deep knowledge of both Tableau's order of operations and DAX's filter context mechanics.
+</system>
 
-**Used in worksheets:** {', '.join(visual_context.get('used_in_worksheets', [])) or 'Unknown'}
-**Visual types:** {', '.join(visual_types) or 'Unknown'}
-**Grouping dimensions (partition_by):** {', '.join(visual_context.get('partition_by', [])) or 'None'}
-**Sort order:** {', '.join(visual_context.get('sort_by', [])) or 'None'}
-**Applied filters:** {', '.join(visual_context.get('filters', [])) or 'None'}
+<task>
+Convert the Tableau calculation below to optimized, production-ready DAX.
+Follow the step-by-step analysis process, then output valid JSON.
+</task>
 
-## DATA PROFILE
+<input>
+<calculation>
+  <name>{calc_name}</name>
+  <type>{calc_type}</type>
+  <formula>{tableau_formula}</formula>
+</calculation>
 
-**Table name:** {table_name}
-**Row count:** {data_profile.get('row_count', 'Unknown')}
-**Columns:** {data_profile.get('column_count', 'Unknown')}
+<context>
+  <table>{table_name}</table>
+  <row_count>{data_profile.get('row_count', 'Unknown')}</row_count>
+  <visual_types>{', '.join(visual_types) or 'Unknown'}</visual_types>
+  <used_in>{', '.join(visual_context.get('used_in_worksheets', [])) or 'Unknown'}</used_in>
+  <partition_by>{', '.join(visual_context.get('partition_by', [])) or 'None'}</partition_by>
+</context>
 
-## CONVERSION PATTERNS LIBRARY
+<detection>
+  <dax_type>{dax_type}</dax_type>
+  <explanation>{'This is a row-level calculation. Evaluates once per row. DO NOT use aggregation functions like SUM/AVG.' if dax_type == 'CALCULATED_COLUMN' else 'This is an aggregate calculation. Summarizes data across rows. MUST use aggregation functions like SUM/AVG.'}</explanation>
+</detection>
+</input>
 
-Below are ALL known conversion patterns. Use these as reference when generating DAX.
-
+<conversion_patterns>
 {patterns_json}
+</conversion_patterns>
 
-## CONTEXT TRANSITION GUIDANCE (Component 2: Order of Operations)
+<examples>
+{examples}
+</examples>
 
-{context_transition_hint}
+<instructions>
+Step 1: ANALYZE the Tableau formula
+  - Identify formula structure (aggregation, IF logic, arithmetic, LOD, table calc)
+  - Determine calculation type (already detected as: {dax_type})
+  - Note any special Tableau functions (ZN, ATTR, SIZE, etc.)
 
-## YOUR TASK
+Step 2: FIND matching pattern
+  - Review patterns above
+  - Identify closest match by formula structure
+  - Note if exact match or requires adaptation
 
-1. **Analyze Tableau's Order of Operations:**
-   - Context filters apply first
-   - FIXED LOD ignores standard filters (use ALLEXCEPT)
-   - EXCLUDE LOD removes dimensions (use ALL on excluded dims)
-   - INCLUDE LOD adds dimensions (no direct equivalent, use SUMMARIZE)
-   - Table calculations run post-aggregation
+Step 3: HANDLE special cases
+  {'- DO NOT wrap fields in SUM/AVG (row-level calculation)' if dax_type == 'CALCULATED_COLUMN' else '- Wrap all field references in SUM/AVG/etc. (aggregate calculation)'}
+  - Use DIVIDE(x, y, 0) instead of x/y to handle division by zero
+  - Map Tableau IFNULL/ZN to DAX DIVIDE or IF
+  - Convert Tableau NULL to DAX BLANK()
+  - For FIXED LOD: Use CALCULATE with ALLEXCEPT
+  - For INCLUDE/EXCLUDE LOD: Use ALL with specific dimensions
 
-2. **Find Matching Pattern:**
-   - Review ALL patterns above
-   - Identify the closest match
-   - Note any differences from the pattern
+Step 4: GENERATE DAX
+  - Use correct syntax for {dax_type}
+  - Always qualify columns: {table_name}[ColumnName]
+  - Follow DAX naming: {'ColumnName = ...' if dax_type == 'CALCULATED_COLUMN' else 'MeasureName = ...'}
+  - Ensure formula is complete (no truncation)
 
-3. **Handle Critical Aspects:**
-   - **Null Handling:** Tableau ZN() vs DAX DIVIDE() with default
-   - **Filter Context:** Use CALCULATE, ALL, ALLEXCEPT appropriately
-   - **Aggregation:** Ensure proper measure vs calculated column
-   - **LOD Expressions:** Map FIXED/INCLUDE/EXCLUDE correctly
-   - **Visual Context:** Adjust DAX based on where calculation is used
+Step 5: VALIDATE
+  - Check syntax is valid DAX
+  - Verify correct calculation type (row-level vs aggregate)
+  - Ensure no division by zero risks
+  - Confirm it matches Tableau behavior
+</instructions>
 
-4. **Generate Optimized DAX:**
-   - Use proper DAX syntax
-   - Include measure name (e.g., "Measure Name = ...")
-   - Use DIVIDE() instead of / for safety
-   - Apply best practices (ALLEXCEPT over multiple ALL)
+<critical_rules>
+{'✓ NO aggregation wrappers (Sales[A] + Sales[B], not SUM)' if dax_type == 'CALCULATED_COLUMN' else '✓ ALWAYS wrap in aggregation (SUM(Sales[A]) + SUM(Sales[B]))'}
+✓ Use DIVIDE(a, b, 0) not a/b
+✓ Always specify table: {table_name}[Column]
+✓ Return complete formula (no truncation)
+✓ Output ONLY valid JSON, no markdown
+✓ Include detailed reasoning
+</critical_rules>
 
-5. **Provide Reasoning:**
-   - Explain your approach
-   - Note which pattern you used (or why you deviated)
-   - Identify any potential issues
-
-6. **Assign Confidence Score:**
-   - 1.0 = Exact pattern match, high confidence
-   - 0.9 = Close match with minor adjustments
-   - 0.8 = Good conversion, some complexity
-   - 0.7 = Complex case, may need validation
-   - <0.7 = Low confidence, manual review recommended
-
-## OUTPUT FORMAT
-
-Return ONLY valid JSON (no markdown code blocks):
+<output_format>
+Return ONLY this JSON structure (no code blocks, no extra text):
 
 {{
-  "dax_formula": "Measure Name = DAX formula here",
-  "reasoning": "Detailed explanation of your approach...",
+  "dax_formula": "{'Column Name' if dax_type == 'CALCULATED_COLUMN' else 'Measure Name'} = [complete DAX formula]",
+  "reasoning": "1. Formula structure: [describe]\n2. Pattern match: [which pattern]\n3. Special handling: [any adaptations]\n4. Validation: [confidence justification]",
   "confidence": 0.95,
-  "pattern_used": "pattern_id or null",
-  "warnings": ["Warning 1 if any", "Warning 2 if any"]
+  "pattern_used": "pattern_id_or_null",
+  "warnings": ["warning1", "warning2"]
 }}
+</output_format>
 
-## IMPORTANT RULES
+<confidence_scale>
+1.0 = Exact pattern match, tested formula
+0.9 = Close match, minor adjustments only
+0.8 = Good conversion, moderate complexity
+0.7 = Complex case, needs validation
+<0.7 = Low confidence, requires manual review
+</confidence_scale>
 
-- ALWAYS use DIVIDE() instead of / to avoid division by zero
-- ALWAYS specify table name: Table[Column]
-- For FIXED LOD, use CALCULATE with ALLEXCEPT
-- For aggregations, create measures (not calculated columns)
-- If visual type is CARD (single value), ensure DAX returns a scalar
-- If visual type is MATRIX, ensure DAX works with grouping context
-- For row-level calculations, use calculated columns
-- Return ONLY JSON, no other text
-
-Now generate the DAX conversion:
+Now convert the calculation above to DAX following all steps and rules.
+Output valid JSON only:
 """
 
         return prompt
+
 
     def _parse_llm_response(self, response: str, original_formula: str) -> DAXResult:
         """

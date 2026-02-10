@@ -83,13 +83,14 @@ class Config:
     AZURE_OPENAI_API_KEY: Optional[str] = os.getenv("AZURE_OPENAI_API_KEY")
     AZURE_OPENAI_ENDPOINT: Optional[str] = os.getenv("AZURE_OPENAI_ENDPOINT")
     AZURE_OPENAI_DEPLOYMENT_NAME: Optional[str] = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4")
-    
+
     # Maximum tokens for LLM response
-    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "800"))
-    
+    # INCREASED FROM 800 TO 4000 to prevent formula truncation
+    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "4000"))
+
     # Temperature for deterministic output
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.1"))
-    
+
     # Enable LLM validation (set to False to disable LLM entirely)
     ENABLE_LLM_VALIDATION: bool = os.getenv("ENABLE_LLM_VALIDATION", "true").lower() == "true"
 
