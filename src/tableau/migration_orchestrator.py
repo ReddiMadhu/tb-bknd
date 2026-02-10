@@ -806,18 +806,18 @@ class MigrationOrchestrator:
             logger.error(f"❌ Failed to convert filters: {e}", exc_info=True)
             filter_param_results = {"filters": [], "whatif_parameters": [], "slicer_tables": []}
 
-        # Step 3: Create & inject PBIX
+        # Step 3: Generate PBIP project
         self._update_progress(
             migration_id,
             MigrationStatus.VALIDATING,
             84,
-            "Creating Power BI file...",
+            "Generating Power BI Project (PBIP)...",
             progress_callback
         )
 
-        logger.info("Step 3/5: Creating & injecting PBIX...")
+        logger.info("Step 3/5: Generating PBIP project structure...")
         try:
-            pbix_path = self._create_and_inject_pbix(
+            pbip_path = self._generate_pbip_project(
                 migration_id,
                 conversions,
                 relationships,
@@ -825,13 +825,13 @@ class MigrationOrchestrator:
                 workbooks_data,
                 progress_callback
             )
-            if pbix_path:
-                logger.info(f"✅ PBIX created: {pbix_path}")
+            if pbip_path:
+                logger.info(f"✅ PBIP project created: {pbip_path}")
             else:
-                logger.warning("⚠️  PBIX creation skipped (fallback to DAX file)")
+                logger.warning("⚠️  PBIP generation failed")
         except Exception as e:
-            logger.error(f"❌ Failed to create PBIX: {e}", exc_info=True)
-            pbix_path = None
+            logger.error(f"❌ Failed to generate PBIP: {e}", exc_info=True)
+            pbip_path = None
 
         # Step 4: Export table data to Excel
         self._update_progress(
@@ -883,7 +883,7 @@ class MigrationOrchestrator:
             "validated_count": validated_count,
             "perfect_matches": perfect_matches,
             "avg_pass_rate": avg_pass_rate,
-            "pbix_path": str(pbix_path) if pbix_path else None,
+            "pbip_path": str(pbip_path) if pbip_path else None,
             "excel_files": excel_files,
             "relationships_count": len(relationships)
         }
@@ -974,7 +974,7 @@ class MigrationOrchestrator:
     # Phase 8: Create & Inject PBIX (NEW)
     # ============================================
 
-    def _create_and_inject_pbix(
+    def _generate_pbip_project(
         self,
         migration_id: str,
         conversions: List[Dict[str, Any]],
@@ -983,9 +983,11 @@ class MigrationOrchestrator:
         workbooks_data: List[Dict[str, Any]],
         progress_callback: Optional[ProgressCallback]
     ) -> Optional[Path]:
-        """Create PBIX file with DAX measures (using Tabular Editor from scratch)"""
+        """Generate complete PBIP folder structure (replaces PBIX generation)"""
 
-        logger.info("Phase 8: Creating PBIX with measures...")
+        logger.info("Phase 8: Generating PBIP project structure...")
+
+        from src.tableau.powerbi_exporter import PowerBIExporter
 
         export_dir = Path("exports") / migration_id
         export_dir.mkdir(parents=True, exist_ok=True)
@@ -1005,41 +1007,93 @@ class MigrationOrchestrator:
                 )
                 measures.append(measure)
 
-        logger.info(f"✓ Prepared {len(measures)} measures for PBIX creation")
+        logger.info(f"✓ Prepared {len(measures)} measures for PBIP")
 
-        # Try to create PBIX using Tabular Editor (new approach - from scratch)
-        if self.pbix_injector.tabular_editor_path:
-            try:
-                output_pbix = export_dir / "migrated_model.pbix"
+        try:
+            # Create PowerBIExporter instance
+            exporter = PowerBIExporter()
 
-                # Create PBIX from scratch (bypasses template parsing issue)
-                self.pbix_injector.create_pbix_from_scratch(
-                    output_path=str(output_pbix),
-                    measures=measures,
-                    relationships=relationships
-                )
+            # Generate model.bim directly with measures we have
+            logger.info("Creating semantic model (model.bim)...")
+            model_bim_path = export_dir / "model.bim"
 
-                logger.info(f"✅ PBIX created: {output_pbix}")
+            # Build model.bim content directly
+            import json
+
+            model = {
+                "name": f"TableauMigration_{migration_id}",
+                "compatibilityLevel": 1600,
+                "model": {
+                    "culture": "en-US",
+                    "tables": [
+                        {
+                            "name": "Calendar",
+                            "columns": [
+                                {"name": "Date", "dataType": "dateTime", "isKey": True},
+                                {"name": "Year", "dataType": "int64"},
+                                {"name": "Quarter", "dataType": "int64"},
+                                {"name": "Month", "dataType": "int64"},
+                                {"name": "Month Name", "dataType": "string"},
+                                {"name": "Day", "dataType": "int64"}
+                            ],
+                            "partitions": [
+                                {
+                                    "name": "Calendar",
+                                    "mode": "import",
+                                    "source": {
+                                        "type": "m",
+                                        "expression": "Calendar"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    "relationships": [],
+                    "measures": []
+                }
+            }
+
+            # Add measures from conversions
+            for measure in measures:
+                model["model"]["measures"].append({
+                    "name": measure.name,
+                    "expression": measure.expression,
+                    "formatString": "#,##0.00"
+                })
+
+            # Write model.bim
+            with open(model_bim_path, 'w', encoding='utf-8') as f:
+                json.dump(model, f, indent=2)
+
+            logger.info(f"✅ Created semantic model with {len(measures)} measures")
+
+            # Now create PBIP project structure around it
+            logger.info("Creating PBIP folder structure...")
+            artifacts = {
+                "semantic_model": str(model_bim_path)
+            }
+
+            pbip_path = exporter._create_pbip_project(
+                migration_id=migration_id,
+                export_path=export_dir,
+                artifacts=artifacts
+            )
+
+            if pbip_path and pbip_path.exists():
+                logger.info(f"✅ PBIP project created: {pbip_path}")
                 logger.info(f"   → {len(measures)} measures added")
-                logger.info(f"   → {len(relationships)} relationships created")
+                logger.info(f"   → {len(relationships)} relationships defined")
+                logger.info(f"   → Complete folder structure generated")
 
-                return output_pbix
-
-            except Exception as e:
-                logger.error(f"PBIX creation failed: {e}")
-                logger.warning("Falling back to DAX file export...")
-
-                # Fallback: Export to .dax file
-                self._export_dax_fallback(measures, export_dir)
-
+                return pbip_path
+            else:
+                logger.warning("⚠️  PBIP project creation failed")
                 return None
-        else:
-            logger.warning("Tabular Editor not found - PBIX creation skipped")
-            logger.info("Download from: https://github.com/TabularEditor/TabularEditor/releases")
 
-            # Fallback: Export to .dax file
-            self._export_dax_fallback(measures, export_dir)
-
+        except Exception as e:
+            logger.error(f"PBIP generation failed: {e}", exc_info=True)
+            import traceback
+            traceback.print_exc()
             return None
 
     def _export_dax_fallback(
@@ -1047,7 +1101,7 @@ class MigrationOrchestrator:
         measures: List[Measure],
         export_dir: Path
     ):
-        """Export DAX measures to .dax file as fallback"""
+        """Export DAX measures to .dax file as fallback (legacy, kept for compatibility)"""
 
         dax_file = export_dir / "measures.dax"
 

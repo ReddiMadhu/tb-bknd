@@ -325,81 +325,142 @@ class PowerBIExporter:
         artifacts: Dict[str, str]
     ) -> Path:
         """
-        Create Power BI Project (.pbip) structure
+        Create complete Power BI Project (.pbip) structure per Microsoft spec
 
         Structure:
-        MigrationProject.Report/
-        ├── report.json
-        ├── definition.pbir
-        ├── .pbip
-        └── .gitignore
+        {migration_id}.pbip/
+        ├── {migration_id}.pbip             # Root project file
+        ├── .gitignore
+        ├── {migration_id}.Report/          # Report layer
+        │   ├── report.json
+        │   ├── semanticModelDiagramLayout.json
+        │   └── .pbi/
+        │       └── localSettings.json
+        └── {migration_id}.SemanticModel/   # Data model layer
+            ├── definition.pbism
+            ├── model.bim
+            ├── diagramLayout.json
+            └── .pbi/
+                └── localSettings.json
         """
-        logger.info("Creating .pbip project structure")
+        logger.info("🏗️  Creating complete PBIP project structure")
 
-        project_name = f"TableauMigration_{migration_id}"
-        pbip_path = export_path / f"{project_name}.Report"
-        pbip_path.mkdir(parents=True, exist_ok=True)
+        # Use migration_id as project name (no special characters)
+        project_name = migration_id
 
-        # 1. Create .pbip file (project definition)
-        pbip_file = pbip_path / f"{project_name}.pbip"
+        # Create root PBIP folder
+        pbip_root = export_path / f"{project_name}.pbip"
+        pbip_root.mkdir(parents=True, exist_ok=True)
 
+        # Create subfolder structure
+        report_folder = pbip_root / f"{project_name}.Report"
+        semantic_model_folder = pbip_root / f"{project_name}.SemanticModel"
+
+        report_folder.mkdir(parents=True, exist_ok=True)
+        semantic_model_folder.mkdir(parents=True, exist_ok=True)
+
+        # Create .pbi subfolders
+        (report_folder / ".pbi").mkdir(exist_ok=True)
+        (semantic_model_folder / ".pbi").mkdir(exist_ok=True)
+
+        # 1. Create root .pbip file (project definition)
+        pbip_file = pbip_root / f"{project_name}.pbip"
+
+        # NOTE: Root .pbip file only references the Report artifact
+        # The Report's definition.pbir file links to the SemanticModel
         pbip_content = {
             "version": "1.0",
             "artifacts": [
                 {
                     "report": {
-                        "path": "report.json",
-                        "type": "Report"
+                        "path": f"{project_name}.Report"
                     }
                 }
-            ],
-            "settings": {}
+            ]
         }
 
-        with open(pbip_file, 'w') as f:
+        with open(pbip_file, 'w', encoding='utf-8') as f:
             json.dump(pbip_content, f, indent=2)
 
-        # 2. Create report.json (report definition)
-        report_file = pbip_path / "report.json"
+        # 2. Create Report/definition.pbir (Report definition with dataset reference)
+        definition_pbir_file = report_folder / "definition.pbir"
 
-        report_content = {
-            "name": project_name,
-            "type": "Report",
-            "pages": [
-                {
-                    "name": "Overview",
-                    "displayName": "Overview"
+        pbir_content = {
+            "version": "1.0",
+            "datasetReference": {
+                "byPath": {
+                    "path": f"../{project_name}.SemanticModel"
                 }
-            ],
-            "dataModelSettings": {
-                "modelDefinitionFile": str(artifacts.get("semantic_model", ""))
             }
         }
 
-        with open(report_file, 'w') as f:
-            json.dump(report_content, f, indent=2)
-
-        # 3. Create definition.pbir (report definition)
-        pbir_file = pbip_path / "definition.pbir"
-
-        pbir_content = {
-            "version": "5.0",
-            "dataModelExtension": "model.bim"
-        }
-
-        with open(pbir_file, 'w') as f:
+        with open(definition_pbir_file, 'w', encoding='utf-8') as f:
             json.dump(pbir_content, f, indent=2)
 
-        # 4. Create .gitignore
-        gitignore_file = pbip_path / ".gitignore"
+        # 3. Create Report/report.json (Report layout and visuals)
+        report_file = report_folder / "report.json"
 
-        with open(gitignore_file, 'w') as f:
-            f.write("*.pbix\n")
-            f.write(".pbi/\n")
+        report_content = {
+            "version": "1.0",
+            "name": project_name,
+            "config": json.dumps({
+                "version": "5.49",
+                "themeCollection": {
+                    "baseTheme": {
+                        "name": "CY24SU06"
+                    }
+                },
+                "activeSectionIndex": 0,
+                "defaultDrillFilterOtherVisuals": True,
+                "sections": [
+                    {
+                        "name": "ReportSection",
+                        "displayName": "Page 1",
+                        "filters": "[]",
+                        "ordinal": 0,
+                        "visualContainers": []  # No visuals - user adds in Power BI Desktop
+                    }
+                ]
+            })
+        }
 
-        logger.info(f"Created .pbip project at {pbip_path}")
+        with open(report_file, 'w', encoding='utf-8') as f:
+            json.dump(report_content, f, indent=2)
 
-        return pbip_path
+        # 4. Create Report/semanticModelDiagramLayout.json (empty)
+        self._create_semantic_model_diagram_layout(report_folder / "semanticModelDiagramLayout.json")
+
+        # 5. Create Report/.pbi/localSettings.json (empty)
+        with open(report_folder / ".pbi" / "localSettings.json", 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+
+        # 6. Create SemanticModel/definition.pbism
+        self._create_definition_pbism(project_name, semantic_model_folder / "definition.pbism")
+
+        # 7. Move model.bim to SemanticModel folder
+        source_bim = Path(artifacts.get("semantic_model", ""))
+        target_bim = semantic_model_folder / "model.bim"
+
+        if source_bim.exists():
+            import shutil
+            shutil.copy(source_bim, target_bim)
+            logger.info(f"✅ Copied model.bim to {target_bim}")
+        else:
+            logger.warning(f"⚠️  model.bim not found at {source_bim}, will be generated inline")
+
+        # 8. Create SemanticModel/diagramLayout.json (empty)
+        self._create_diagram_layout(semantic_model_folder / "diagramLayout.json")
+
+        # 9. Create SemanticModel/.pbi/localSettings.json (empty)
+        with open(semantic_model_folder / ".pbi" / "localSettings.json", 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+
+        # 10. Create root .gitignore
+        self._create_pbip_gitignore(pbip_root / ".gitignore")
+
+        logger.info(f"✅ Created complete PBIP project at {pbip_root}")
+
+        return pbip_root
 
     # ============================================
     # Migration Report
@@ -490,6 +551,99 @@ class PowerBIExporter:
             f.write("\n".join(lines))
 
         logger.info("Created migration report")
+
+        return output_path
+
+    # ============================================
+    # PBIP Helper Methods
+    # ============================================
+
+    def _create_definition_pbism(
+        self,
+        project_name: str,
+        output_path: Path
+    ) -> Path:
+        """
+        Create definition.pbism file (semantic model metadata)
+
+        This file contains metadata about the semantic model configuration
+        """
+        pbism_content = {
+            "version": "1.0.0",
+            "name": project_name,
+            "compatibilityLevel": 1604,
+            "model": {
+                "culture": "en-US",
+                "dataAccessOptions": {
+                    "legacyRedirects": True,
+                    "returnErrorValuesAsNull": True
+                }
+            }
+        }
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(pbism_content, f, indent=2)
+
+        logger.debug(f"Created definition.pbism at {output_path}")
+
+        return output_path
+
+    def _create_diagram_layout(self, output_path: Path) -> Path:
+        """
+        Create diagramLayout.json (empty is fine for new projects)
+
+        This file stores the visual layout of tables in the Model view
+        """
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+
+        logger.debug(f"Created diagramLayout.json at {output_path}")
+
+        return output_path
+
+    def _create_semantic_model_diagram_layout(self, output_path: Path) -> Path:
+        """
+        Create semanticModelDiagramLayout.json
+
+        Stores diagram preferences for the semantic model view
+        """
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+
+        logger.debug(f"Created semanticModelDiagramLayout.json at {output_path}")
+
+        return output_path
+
+    def _create_pbip_gitignore(self, output_path: Path) -> Path:
+        """
+        Create .gitignore for PBIP project
+
+        Excludes local settings, cache files, and OS-specific files
+        """
+        gitignore_content = """# Power BI local settings
+.pbi/localSettings.json
+*.pbi/localSettings.json
+
+# Cache files
+*.cache.abf
+cache.abf
+
+# Unapplied changes
+unappliedChanges.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+"""
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(gitignore_content.strip())
+
+        logger.debug(f"Created .gitignore at {output_path}")
 
         return output_path
 

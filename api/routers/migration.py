@@ -1025,31 +1025,56 @@ async def get_data_quality(migration_id: str):
         quality_results = []
 
         for workbook in workbooks:
-            # Get hyper file path from workbook metadata
-            if hasattr(workbook, 'hyper_path') and workbook.hyper_path:
+            logger.info(f"[DATA QUALITY] Processing workbook: {workbook.filename}, file_path: {workbook.file_path}")
+
+            # FIX: Parse TWBX dynamically to get Hyper path (hyper_path field doesn't exist in database)
+            if workbook.file_path and workbook.file_path.endswith('.twbx'):
                 try:
-                    profiler = HyperDataProfiler(workbook.hyper_path)
+                    from src.tableau.twb_parser import TableauTWBParser
+
+                    logger.info(f"[DATA QUALITY] Parsing TWBX file: {workbook.file_path}")
+                    # Extract Hyper file from TWBX
+                    parser = TableauTWBParser(workbook.file_path)
+                    if not parser.hyper_files:
+                        logger.warning(f"[DATA QUALITY] No Hyper files found in {workbook.filename}")
+                        continue
+
+                    hyper_path = str(parser.hyper_files[0])
+                    logger.info(f"[DATA QUALITY] Found Hyper file: {hyper_path}")
+
+                    profiler = HyperDataProfiler(hyper_path)
                     tables = profiler.list_tables()
+                    logger.info(f"[DATA QUALITY] Found {len(tables)} tables: {tables}")
 
                     for table in tables:
-                        # Get table profile
-                        row_count = profiler.get_row_count(table)
+                        # Unquote table name for profiler methods (profiler adds quotes internally)
+                        # "Extract"."TableName" → Extract.TableName
+                        table_unquoted = str(table).strip('"').replace('".\"', '.')
 
-                        # PERFORMANCE FIX #4: Use sampling for duplicate detection (10-30x faster)
-                        # Samples 10K rows instead of full table scan
-                        duplicate_count = profiler.detect_duplicates(table, sample_size=10000)
+                        logger.info(f"[DATA QUALITY] Profiling table: {table} (unquoted: {table_unquoted})")
+
+                        # Simple approach: just get row count and duplicates
+                        # Use read_table for row count (fast, doesn't need information_schema)
+                        df = profiler.read_table(table_unquoted, limit=10001)  # Limit to check if > 10K
+                        row_count = len(df)
+
+                        # Duplicate detection
+                        duplicate_count = profiler.detect_duplicates(table_unquoted, sample_size=10000)
                         duplicate_rate = (duplicate_count / row_count * 100) if row_count > 0 else 0
 
                         quality_results.append({
-                            "table_name": table,
+                            "table_name": table,  # Keep original quoted name for response
                             "row_count": row_count,
                             "duplicate_count": duplicate_count,
                             "duplicate_rate": round(duplicate_rate, 2),
                             "status": "good" if duplicate_rate < 1 else "warning"
                         })
+                        logger.info(f"[DATA QUALITY] Profiled table {table}: {row_count} rows, {duplicate_rate:.2f}% duplicates")
                 except Exception as e:
-                    logger.error(f"Failed to profile table: {e}")
+                    logger.error(f"[DATA QUALITY] Failed to profile table: {e}", exc_info=True)
                     continue
+            else:
+                logger.warning(f"[DATA QUALITY] Skipping workbook - not a TWBX file or no file_path: {workbook.file_path}")
 
         return {"tables": quality_results}
 
@@ -1168,21 +1193,42 @@ async def get_table_classifications(migration_id: str):
         classifications = []
 
         for workbook in workbooks:
-            if hasattr(workbook, 'hyper_path') and workbook.hyper_path:
+            logger.info(f"[TABLE CLASSIFICATIONS] Processing workbook: {workbook.filename}, file_path: {workbook.file_path}")
+
+            # FIX: Parse TWBX dynamically to get Hyper path (hyper_path field doesn't exist in database)
+            if workbook.file_path and workbook.file_path.endswith('.twbx'):
                 try:
-                    profiler = HyperDataProfiler(workbook.hyper_path)
+                    from src.tableau.twb_parser import TableauTWBParser
+
+                    logger.info(f"[TABLE CLASSIFICATIONS] Parsing TWBX file: {workbook.file_path}")
+                    # Extract Hyper file from TWBX
+                    parser = TableauTWBParser(workbook.file_path)
+                    if not parser.hyper_files:
+                        logger.warning(f"[TABLE CLASSIFICATIONS] No Hyper files found in {workbook.filename}")
+                        continue
+
+                    hyper_path = str(parser.hyper_files[0])
+                    logger.info(f"[TABLE CLASSIFICATIONS] Found Hyper file: {hyper_path}")
+
+                    profiler = HyperDataProfiler(hyper_path)
                     tables = profiler.list_tables()
+                    logger.info(f"[TABLE CLASSIFICATIONS] Found {len(tables)} tables: {tables}")
 
                     for table in tables:
-                        # Profile the table
-                        row_count = profiler.get_row_count(table)
-                        columns = profiler.get_columns(table)
-                        numeric_cols = [c for c in columns if c['data_type'] in ['INTEGER', 'REAL', 'NUMERIC', 'DOUBLE']]
+                        # Unquote table name for profiler methods (profiler adds quotes internally)
+                        # "Extract"."TableName" → Extract.TableName
+                        table_unquoted = str(table).strip('"').replace('".\"', '.')
 
-                        # PERFORMANCE FIX #4: Use sampling for duplicate detection (10-30x faster)
-                        # OLD: Full table scan on large tables (10-30 seconds for 1M rows)
-                        # NEW: Sample-based detection (1-2 seconds, 95%+ accuracy)
-                        duplicate_count = profiler.detect_duplicates(table, sample_size=10000)
+                        logger.info(f"[TABLE CLASSIFICATIONS] Profiling table: {table} (unquoted: {table_unquoted})")
+
+                        # Use profile_table() which works correctly (like workbook_metadata endpoint)
+                        profile = profiler.profile_table(table_unquoted, sample_size=10000)
+                        row_count = profile.row_count
+                        columns = profile.columns
+                        numeric_cols = [c for c in columns if c.data_type in ['int64', 'float64', 'Int64', 'Float64']]
+
+                        # Duplicate detection
+                        duplicate_count = profiler.detect_duplicates(table_unquoted, sample_size=10000)
                         duplicate_rate = (duplicate_count / row_count * 100) if row_count > 0 else 0
 
                         # Classify as FACT or DIMENSION
@@ -1201,19 +1247,19 @@ async def get_table_classifications(migration_id: str):
                             confidence = 70
                             reasoning = "Moderate characteristics, likely a dimension table"
 
-                        # Detect potential primary key
+                        # Detect potential primary key from column profiles
                         pk_column = None
                         pk_uniqueness = 0
 
+                        # Find column with highest cardinality (most unique values)
                         for col in columns:
-                            uniqueness = profiler.get_column_uniqueness(table, col['name'])
-                            if uniqueness >= 99:
-                                pk_column = col['name']
-                                pk_uniqueness = round(uniqueness, 1)
+                            if col.cardinality >= 0.99:  # 99%+ unique
+                                pk_column = str(col.column_name)
+                                pk_uniqueness = round(col.cardinality * 100, 1)
                                 break
 
                         classifications.append({
-                            "table_name": table,
+                            "table_name": table,  # Keep original quoted name for response
                             "classification": classification,
                             "confidence_score": confidence,
                             "row_count": row_count,
@@ -1223,11 +1269,15 @@ async def get_table_classifications(migration_id: str):
                             "pk_uniqueness": pk_uniqueness,
                             "reasoning": reasoning
                         })
+                        logger.info(f"[TABLE CLASSIFICATIONS] Classified table {table} as {classification} (confidence: {confidence})")
 
                 except Exception as e:
-                    logger.error(f"Failed to classify tables: {e}")
+                    logger.error(f"[TABLE CLASSIFICATIONS] Failed to classify tables: {e}", exc_info=True)
                     continue
+            else:
+                logger.warning(f"[TABLE CLASSIFICATIONS] Skipping workbook - not a TWBX file or no file_path: {workbook.file_path}")
 
+        logger.info(f"[TABLE CLASSIFICATIONS] Returning {len(classifications)} table classifications")
         return {"tables": classifications}
 
     except Exception as e:
@@ -1445,7 +1495,10 @@ async def trigger_conversion(migration_id: str, background_tasks: BackgroundTask
 
 
 @router.get("/{migration_id}/conversion-report")
-async def download_conversion_report(migration_id: str):
+async def download_conversion_report(
+    migration_id: str,
+    conversion_ids: Optional[str] = None  # Comma-separated conversion IDs
+):
     """
     Download Excel conversion report for Page 4 - DAX Conversion
 
@@ -1457,6 +1510,9 @@ async def download_conversion_report(migration_id: str):
     - Status (Auto-converted, Manual review, Failed)
     - Warnings
 
+    Query params:
+        conversion_ids: Optional comma-separated list of conversion IDs to export
+
     Returns:
         Excel file download
     """
@@ -1467,6 +1523,11 @@ async def download_conversion_report(migration_id: str):
         # Get conversions
         conversions = migration_store.get_conversions_by_migration(migration_id)
         calculations = migration_store.get_calculations_by_migration(migration_id)
+
+        # Filter by selected conversion IDs if provided
+        if conversion_ids:
+            selected_ids = set(conversion_ids.split(','))
+            conversions = [c for c in conversions if c.conversion_id in selected_ids]
 
         # Create mapping of calc_id to calculation
         calc_map = {c.calc_id: c for c in calculations}
@@ -1716,14 +1777,29 @@ async def download_all_artifacts(migration_id: str):
             else:
                 logger.warning(f"⚠️  Export directory does not exist: {export_dir}")
 
-            # 2. PBIX file (if exists)
-            pbix_path = export_dir / "migrated_model.pbix"
-            logger.info(f"🔍 Checking for PBIX: {pbix_path}")
-            if pbix_path.exists():
-                zip_file.write(pbix_path, "migrated_model.pbix")
-                logger.info("✅ Added PBIX file to package")
+            # 2. PBIP folder (replaces PBIX - text-based Power BI Project)
+            pbip_folder = None
+            for item in export_dir.iterdir():
+                if item.is_dir() and item.name.endswith('.pbip'):
+                    pbip_folder = item
+                    break
+
+            logger.info(f"🔍 Checking for PBIP folder...")
+            if pbip_folder and pbip_folder.exists():
+                logger.info(f"📦 Adding PBIP project folder: {pbip_folder.name}")
+
+                # Add entire PBIP folder structure to ZIP
+                for pbip_file in pbip_folder.rglob('*'):
+                    if pbip_file.is_file():
+                        # Preserve folder structure in ZIP
+                        arcname = pbip_file.relative_to(export_dir)
+                        zip_file.write(pbip_file, str(arcname))
+
+                logger.info(f"✅ Added PBIP project with {len(list(pbip_folder.rglob('*')))} total items")
             else:
-                logger.warning("⚠️  PBIX file not found, skipping")
+                logger.warning("⚠️  PBIP folder not found (expected format: {migration_id}.pbip)")
+
+            # NOTE: PBIX generation has been removed - PBIP is now the only format
 
             # 3. DAX measures file
             dax_path = export_dir / "measures.dax"
@@ -1821,7 +1897,7 @@ async def download_all_artifacts(migration_id: str):
             readme += f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             readme += "## Contents\n\n"
             readme += "### Core Files\n"
-            readme += "- `migrated_model.pbix` - Ready-to-use Power BI file (if generated)\n"
+            readme += f"- `{migration_id}.pbip/` - Power BI Project folder (text-based, Git-friendly)\n"
             readme += "- `dax_measures.dax` - All DAX measure definitions\n"
             readme += "- `migration_metadata.json` - Migration job metadata\n\n"
             readme += "### Reports & Documentation\n"
@@ -1830,11 +1906,26 @@ async def download_all_artifacts(migration_id: str):
             readme += "- `visual_conversion.md` - Visual conversion details\n\n"
             readme += "### Table Data\n"
             readme += "- `table_data/` - Exported table data as Excel files\n\n"
+            readme += "## Opening the Migration\n\n"
+            readme += "### Step 1: Extract the ZIP\n"
+            readme += "Extract all contents to a folder on your computer. Keep the folder structure intact.\n\n"
+            readme += "### Step 2: Open in Power BI Desktop\n"
+            readme += "1. Open Power BI Desktop (version 2.120 or later)\n"
+            readme += "2. Click: File → Open → Browse\n"
+            readme += f"3. Navigate to the `{migration_id}.pbip` folder\n"
+            readme += f"4. Select the `.pbip` file inside the folder (e.g., `{migration_id}.pbip`)\n"
+            readme += "5. Power BI will load the project with all measures and data model\n\n"
+            readme += "### Why PBIP?\n"
+            readme += "- ✅ Text-based files (easy to version control with Git)\n"
+            readme += "- ✅ No external dependencies (no Tabular Editor required)\n"
+            readme += "- ✅ Same functionality as PBIX files\n"
+            readme += "- ✅ Modern Power BI standard for CI/CD workflows\n"
+            readme += "- ✅ Easier team collaboration with meaningful diffs\n\n"
             readme += "## Next Steps\n\n"
-            readme += "1. Open `migrated_model.pbix` in Power BI Desktop\n"
-            readme += "2. Review `conversion_report.xlsx` for conversion details\n"
-            readme += "3. Check `filter_parameter_conversion.md` for filter setup\n"
-            readme += "4. Use table data files to load data into Power BI\n"
+            readme += "1. Review `conversion_report.xlsx` for conversion details\n"
+            readme += "2. Check `filter_parameter_conversion.md` for filter setup\n"
+            readme += "3. Use table data files to load data into Power BI\n"
+            readme += "4. Build report visuals in Power BI Desktop\n"
             readme += "5. Validate results against original Tableau workbook\n"
 
             zip_file.writestr("README.md", readme)
