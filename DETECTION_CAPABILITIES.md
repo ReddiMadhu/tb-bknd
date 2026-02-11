@@ -1,495 +1,134 @@
-# Relationship Detection Capabilities and Limitations
-
-This document outlines what relationships the system **CAN** and **CANNOT** detect, with real-world examples.
-
----
-
-## ✅ Cases WHERE the System CAN Find Relationships
-
-### 1. **Exact Column Name Match with High Overlap**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  customer_id: [1001, 1002, 1003, 1004, 1005]
-
-File 2 (customers.xlsx):
-  customer_id: [1001, 1002, 1003, 1004, 1005, 1006]
-```
-
-**Result:** ✅ **HIGH confidence** (95%) - Exact name match, 83% value overlap, clear PK-FK relationship
-
----
-
-### 2. **Name Variations (Case, Underscores, Spaces)**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  CustomerID: [1001, 1002, 1003]
-
-File 2 (customers.xlsx):
-  customer_id: [1001, 1002, 1003, 1004]
-```
-
-**Result:** ✅ **HIGH confidence** (90%) - Normalized names match (`customerid`), high overlap
-
----
-
-### 3. **Common Abbreviations**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  cust_id: [1001, 1002, 1003]
-
-File 2 (customers.xlsx):
-  customer_id: [1001, 1002, 1003, 1004]
-```
-
-**Result:** ✅ **HIGH confidence** (90%) - Abbreviation expansion matches, high overlap
-
-**Other abbreviations detected:**
-- `prod_id` ↔ `product_id`
-- `qty` ↔ `quantity`
-- `amt` ↔ `amount`
-- `dt` ↔ `date`
-
----
-
-### 4. **Format Mismatches (Prefix/Suffix Differences)**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  customer_code: ["CUST-001234", "CUST-001235", "CUST-001236"]
-
-File 2 (customers.xlsx):
-  id: ["001234", "001235", "001236"]
-```
-
-**Result:** ✅ **MEDIUM confidence** (75%) - Detected prefix mismatch, transformation needed: `STRIP_PREFIX('CUST-')`
-
----
-
-### 5. **Case Sensitivity Issues**
-
-**Example:**
-```
-File 1 (sales.xlsx):
-  country: ["USA", "UK", "CANADA"]
-
-File 2 (regions.xlsx):
-  country_code: ["usa", "uk", "canada"]
-```
-
-**Result:** ✅ **MEDIUM confidence** (75%) - Case mismatch detected, transformation needed: `UPPER()` or `LOWER()`
-
----
-
-### 6. **Semantic Similarity (with LLM)**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  order_date: ["2023-01-15", "2023-01-16", "2023-01-17"]
-
-File 2 (transactions.xlsx):
-  transaction_date: ["2023-01-15", "2023-01-16", "2023-01-17"]
-```
-
-**Result:** ✅ **MEDIUM confidence** (70-85%) - Semantic similarity detected, LLM validates as related
-
-**Other examples:**
-- `revenue` ↔ `net_sales`
-- `region_name` ↔ `territory`
-- `unit_price` ↔ `list_price`
-
----
-
-### 7. **Primary Key to Foreign Key (1:N)**
-
-**Example:**
-```
-File 1 (customers.xlsx):
-  customer_id: [1001, 1002, 1003]  # 100% unique
-
-File 2 (orders.xlsx):
-  customer_id: [1001, 1001, 1002, 1002, 1003]  # Duplicates
-```
-
-**Result:** ✅ **HIGH confidence** (95%) - Clear PK-FK relationship, cardinality: 1:N
-
----
-
-### 8. **One-to-One Relationships**
-
-**Example:**
-```
-File 1 (users.xlsx):
-  user_id: [1, 2, 3]  # 100% unique
-
-File 2 (user_profiles.xlsx):
-  user_id: [1, 2, 3]  # 100% unique
-```
-
-**Result:** ✅ **HIGH confidence** (95%) - Both columns unique, cardinality: 1:1
-
----
-
-### 9. **Natural Keys (Meaningful IDs)**
-
-**Example:**
-```
-File 1 (products.xlsx):
-  product_code: ["SKU-12345", "SKU-12346", "SKU-12347"]
-
-File 2 (inventory.xlsx):
-  sku: ["SKU-12345", "SKU-12346", "SKU-12347"]
-```
-
-**Result:** ✅ **HIGH confidence** (90%) - Natural key pattern detected
-
----
-
-### 10. **Integer Sequential IDs**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  order_id: [1, 2, 3, 4, 5]  # Sequential surrogate key
-
-File 2 (shipments.xlsx):
-  order_id: [1, 2, 3, 4]  # References orders
-```
-
-**Result:** ✅ **HIGH confidence** (95%) - Sequential pattern recognized, clear FK
-
----
-
-## ❌ Cases WHERE the System CANNOT Find Relationships
-
-### 1. **Different Column Names with No Semantic Similarity**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  buyer_id: [1001, 1002, 1003]
-
-File 2 (customers.xlsx):
-  id: [1001, 1002, 1003, 1004]
-```
-
-**Result:** ❌ **NO relationship detected** - `buyer_id` and `id` are too different, no semantic link without LLM
-
-**Note:** *With LLM validation enabled, this MIGHT be detected at LOW confidence if sample values overlap significantly*
-
----
-
-### 2. **Low Value Overlap (<40%)**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  customer_id: [1001, 1002, 1003, 1004, 1005]
-
-File 2 (customers.xlsx):
-  customer_id: [2001, 2002, 2003, 2004, 2005]  # Completely different values
-```
-
-**Result:** ❌ **NO relationship detected** - Despite name match, value overlap is 0%
-
----
-
-### 3. **Different Data Types (Non-Convertible)**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  customer_id: [1001, 1002, 1003]  # Integer
-
-File 2 (customers.xlsx):
-  customer_code: ["ALPHA", "BETA", "GAMMA"]  # String (not convertible)
-```
-
-**Result:** ❌ **NO relationship detected** - Incompatible data types
-
----
-
-### 4. **Granularity Mismatch (Aggregated vs Raw)**
-
-**Example:**
-```
-File 1 (daily_sales.xlsx):
-  date: ["2023-01-01", "2023-01-02", "2023-01-03", ...]  # Daily
-  sales: [1000, 1500, 2000, ...]
-
-File 2 (monthly_summary.xlsx):
-  month: ["2023-01", "2023-02", "2023-03"]  # Monthly
-  total_sales: [45000, 50000, 60000]
-```
-
-**Result:** ❌ **NOT joinable** (flagged as `GRANULARITY_MISMATCH`)
-- System detects this is aggregated data
-- Recommendation: "Use as filter, not join"
-
----
-
-### 5. **Completely Unrelated Columns**
-
-**Example:**
-```
-File 1 (products.xlsx):
-  product_name: ["Widget A", "Widget B", "Widget C"]
-
-File 2 (customers.xlsx):
-  customer_email: ["user1@example.com", "user2@example.com"]
-```
-
-**Result:** ❌ **NO relationship detected** - No name similarity, no data overlap, different semantic domains
-
----
-
-### 6. **Encrypted or Hashed Values**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  customer_id: [1001, 1002, 1003]
-
-File 2 (customers.xlsx):
-  customer_hash: ["5f4dcc3b5aa765d61d8327deb882cf99", "098f6bcd4621d373cade4e832627b4f6"]
-```
-
-**Result:** ❌ **NO relationship detected** - Values have 0% overlap due to hashing
-
----
-
-### 7. **Composite Keys (Not Fully Implemented)**
-
-**Example:**
-```
-File 1 (sales.xlsx):
-  (region + product_id) = Composite PK  # Unique together
-  region: ["EAST", "EAST", "WEST"]
-  product_id: [101, 102, 101]
-
-File 2 (products.xlsx):
-  product_id: [101, 102, 103]  # Simple PK
-```
-
-**Result:** ❌ **Partial detection only** - System will find `product_id` match but NOT the composite key
-- This is a **known limitation** in current implementation
-
----
-
-### 8. **Many-to-Many Without Bridge Table**
-
-**Example:**
-```
-File 1 (students.xlsx):
-  student_id: [1, 2, 3]
-
-File 2 (courses.xlsx):
-  course_id: [101, 102, 103]
-```
-
-**Result:** ❌ **NO relationship detected** - No direct link (needs a bridge table: `enrollments`)
-
-**What's missing:** `enrollments.xlsx` with `(student_id, course_id)` pairs
-
----
-
-### 9. **Temporal Range Joins (SCD Type 2)**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  order_date: ["2023-01-15"]
-
-File 2 (price_history.xlsx):
-  product_id: [101]
-  effective_from: ["2023-01-01"]
-  effective_to: ["2023-01-31"]
-  price: [99.99]
-```
-
-**Result:** ❌ **NOT detected** - System cannot infer range joins (between clauses)
-- This is a **known limitation** - would require special temporal logic
-
----
-
-### 10. **Fuzzy String Matching Beyond Threshold**
-
-**Example:**
-```
-File 1 (customers.xlsx):
-  company_name: ["Acme Corp", "Beta Industries", "Gamma LLC"]
-
-File 2 (invoices.xlsx):
-  customer: ["ACME Corporation Inc.", "Beta Ind.", "Gamma Limited"]
-```
-
-**Result:** ❌ **LOW or NO confidence** - Fuzzy match threshold not met (<85% similarity)
-- "Acme Corp" vs "ACME Corporation Inc." = ~75% similarity
-- May require manual mapping
-
----
-
-### 11. **Calculated/Derived Fields**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  subtotal: [100, 200, 300]
-  tax: [10, 20, 30]
-  total: [110, 220, 330]  # Calculated: subtotal + tax
-
-File 2 (invoices.xlsx):
-  invoice_total: [110, 220, 330]
-```
-
-**Result:** ❌ **NO relationship detected** - `total` is a derived field, not a joinable key
-
----
-
-### 12. **Self-Referencing Relationships (Hierarchies)**
-
-**Example:**
-```
-File: employees.xlsx
-  employee_id: [1, 2, 3, 4, 5]
-  manager_id: [NULL, 1, 1, 2, 2]  # References same table
-```
-
-**Result:** ❌ **NOT detected** - System doesn't analyze intra-file relationships
-- This is a **known limitation** - only cross-file relationships are detected
-
----
-
-### 13. **Missing or NULL-Heavy Foreign Keys**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  customer_id: [1001, NULL, NULL, NULL, 1002]  # 60% NULL
-
-File 2 (customers.xlsx):
-  customer_id: [1001, 1002, 1003, 1004]
-```
-
-**Result:** ⚠️ **Detected but LOW quality** - Relationship found but flagged:
-- Warning: "60% NULL values in source column"
-- Recommendation: "Investigate NULL source or use LEFT JOIN"
-
----
-
-## 🔶 Edge Cases and Partial Detection
-
-### 1. **Pre-Joined Data (Denormalized Tables)**
-
-**Example:**
-```
-File: orders_with_customer_details.xlsx
-  order_id: [1, 2, 3]
-  customer_id: [1001, 1002, 1003]
-  customer_name: ["John", "Jane", "Bob"]  # Already joined!
-  customer_region: ["EAST", "WEST", "EAST"]
-```
-
-**Result:** ⚠️ **Partial detection**
-- System detects: `customer_*` columns are pre-joined
-- Warning: "Data may already be denormalized"
-- Recommendation: "Extract dimension: customer_id, customer_name, customer_region"
-
----
-
-### 2. **Orphan Records (Referential Integrity Violations)**
-
-**Example:**
-```
-File 1 (orders.xlsx):
-  customer_id: [1001, 1002, 9999]  # 9999 doesn't exist in customers
-
-File 2 (customers.xlsx):
-  customer_id: [1001, 1002, 1003]
-```
-
-**Result:** ⚠️ **Detected but with warnings**
-- Confidence: HIGH (90%)
-- Warning: "1 orphan record in orders (33% data quality issue)"
-
----
-
-### 3. **Duplicate Primary Keys**
-
-**Example:**
-```
-File 1 (customers.xlsx):
-  customer_id: [1001, 1002, 1002, 1003]  # 1002 is duplicated!
-```
-
-**Result:** ⚠️ **Flagged as data quality issue**
-- Warning: "DUPLICATE PRIMARY KEY DETECTED"
-- Recommendation: "De-duplicate or use composite key"
-
----
-
-## Summary Table
-
-| Scenario | Can Detect? | Confidence Level | Notes |
-|----------|-------------|------------------|-------|
-| Exact name + high overlap | ✅ Yes | HIGH (95%) | Best case scenario |
-| Name variations (case, underscores) | ✅ Yes | HIGH (90%) | |
-| Abbreviations (cust → customer) | ✅ Yes | HIGH (90%) | |
-| Format mismatch (CUST-001 vs 001) | ✅ Yes | MEDIUM (75%) | Transformation needed |
-| Semantic similarity (with LLM) | ✅ Yes | MEDIUM (70-85%) | Requires LLM |
-| Different names, low overlap | ❌ No | - | |
-| Incompatible data types | ❌ No | - | |
-| Granularity mismatch | ⚠️ Flagged | - | Not joinable |
-| Composite keys | ⚠️ Partial | - | Known limitation |
-| Many-to-many (no bridge) | ❌ No | - | Needs bridge table |
-| Temporal range joins | ❌ No | - | Known limitation |
-| Self-referencing | ❌ No | - | Intra-file only |
-| Encrypted/hashed values | ❌ No | - | 0% overlap |
-| Pre-joined data | ⚠️ Warns | - | Suggests extraction |
-| Orphan records | ⚠️ Warns | HIGH | Data quality issue |
-
----
-
-## Recommendations
-
-### To Maximize Detection Success:
-
-1. ✅ **Use consistent naming conventions** across files
-2. ✅ **Maintain high data quality** (minimize NULLs, duplicates)
-3. ✅ **Keep natural keys recognizable** (avoid hashing)
-4. ✅ **Normalize data** before analysis (avoid pre-joined tables)
-5. ✅ **Enable LLM validation** for semantic matching
-
-### Known Limitations (Future Enhancements):
-
-- 🔧 Composite key detection (multi-column unique)
-- 🔧 Temporal range joins (BETWEEN clauses)
-- 🔧 Self-referencing relationships (hierarchies)
-- 🔧 Bridge table inference (M:N relationships)
-- 🔧 Advanced fuzzy matching (>85% threshold)
-
----
-
-## Testing Your Data
-
-To see what the system can detect in YOUR Excel files:
-
-```bash
-# Run without LLM (faster, deterministic only)
-python -m src.main your_file1.xlsx your_file2.xlsx --no-llm
-
-# Run with LLM (slower, semantic matching)
-python -m src.main your_file1.xlsx your_file2.xlsx
-```
-
-Check the generated JSON report:
-- `"confidence_level": "HIGH"` = Strong relationship
-- `"confidence_level": "MEDIUM"` = Likely relationship, needs review
-- `"confidence_level": "LOW"` = Weak relationship, manual validation recommended
+Migration Orchestrator Deep Dive: Tableau to Power BI
+This document provides a comprehensive, code-level explanation of the orchestrator.execute_migration process. It details the 7-phase pipeline that transforms a Tableau workbook into a Power BI solution.
+
+1. Overview: The 7-Phase Pipeline
+The migration is orchestrated by 
+MigrationOrchestrator
+ in 
+src/tableau/migration_orchestrator.py
+. It executes the following phases sequentially:
+
+Parsing: Extract metadata from .twbx files.
+Data Profiling: Analyze .hyper extracts for ground truth and statistics.
+Logic Graph Construction: Build a dependency DAG to determine execution order.
+DAX Generation: AI-powered conversion of Tableau formulas to DAX.
+Validation: High-fidelity comparison of Tableau vs. DAX results.
+Model Building: Construct the Power BI semantic model (relationships, tables).
+PBIX Injection: Programmatically apply changes to a PBIX file.
+Phase 1: Parsing (
+TableauTWBParser
+)
+Goal: Extract all structural and logical metadata from the Tableau workbook.
+
+Technical Implementation:
+
+File Handling: Unzips .twbx files to memory. Extracts .twb (XML) and .hyper (Data) files.
+XML Parsing: Uses lxml to traverse the Tableau XML tree.
+Critical Metadata Extracted:
+Calculated Fields: Extracts formula, role (measure/dimension), and data type.
+LOD Expressions: Identifies FIXED, INCLUDE, EXCLUDE patterns using Regex (r'\{(FIXED|INCLUDE|EXCLUDE)...').
+Visual Context: Parses worksheets to determine how calculations are used (Rows, Columns, Marks). This is critical for DAX generation (e.g., distinguishing a scalar Card visual from a Matrix).
+Filters: specifically identifies Context Filters, which require KEEPFILTERS or specific CALCULATE patterns in DAX.
+Key Insight: The parser goes beyond simple formula extraction; it builds a "Visual Context" map (used_in_worksheets, visual_types) that informs the AI on how to construct the DAX (e.g., whether to return a scalar or a table-dependent value).
+
+Phase 2: Data Profiling (
+HyperDataProfiler
+)
+Goal: Understand the underlying data and establish a "Ground Truth" for validation.
+
+Technical Implementation:
+
+Hyper API / DuckDB: Uses the native Tableau Hyper API (if available) or falls back to DuckDB to read .hyper extracts.
+Profiling:
+Generates column statistics: null_percent, 
+cardinality
+, distinct_count.
+Identifies Primary Keys: Columns with 100% uniqueness and 0 nulls.
+Ground Truth Extraction:
+The 
+execute_tableau_formula
+ method allows the system to run Tableau formulas against the raw data (using Pandas/DuckDB simulation) to get expected values.
+Example: Translates SUM([Sales]) / SUM([Profit]) into a Pandas operation to calculate the exact number for validation.
+Phase 3: Logic Graph Construction (
+LogicGraphBuilder
+)
+Goal: resolve dependencies and determine the correct order of conversion.
+
+Technical Implementation:
+
+Dependency DAG: Uses networkx.DiGraph to build a Directed Acyclic Graph.
+Nodes: Calculations and Base Fields.
+Edges: Dependencies (Calc A depends on Calc B).
+Topological Sort: Determines the Execution Order. Base fields -> Level 1 Calcs -> Level 2 Calcs. This ensures that when Calc B is converted, Calc A (which it depends on) has already been converted.
+Granularity Detection:
+Analyzes formulas to classify them as ROW_LEVEL (Calculated Column) or AGGREGATE (Measure).
+Self-Correction: A "Refinement Pass" upgrades CALCULATED_COLUMN to MEASURE if it depends on another Measure, preventing incorrect aggregation handling.
+Context Transition Analysis (Component 2):
+Analyzes how the evaluation context changes from Tableau to DAX.
+FIXED LOD: Maps to CALCULATE(..., ALLEXCEPT(...)) or ALL(...).
+Context Filters: Maps to CALCULATE(..., KEEPFILTERS(...)).
+Visual Context: Metadata from Phase 1 is attached to nodes to guide DAX strategies (e.g., "This is used in a Matrix, so preserve grouping").
+Phase 4: DAX Generation (
+DAXGenerator
+)
+Goal: Convert Tableau formulas to optimized, production-ready DAX.
+
+Technical Implementation:
+
+Exact Pattern Match:
+Checks a strict patterns.yaml library for known formulas (e.g., specific KPI patterns).
+If confidence > 99%, uses the pre-approved DAX immediately.
+LLM Generation:
+Prompt Engineering: Constructs a rich prompt containing:
+Tableau Formula: The code to convert.
+Visual Context: "Used in a Matrix visual grouped by [Region]".
+Data Profile: "Column [Sales] has 0 nulls".
+Context Transition: "This is a FIXED LOD, so use ALLEXCEPT (from Component 2)".
+Field Reference Guide: XML block telling the LLM how to handle each dependency (e.g., <dax_usage>[Net Profit] (DO NOT WRAP)</dax_usage>).
+Output: JSON object with 
+dax_formula
+, reasoning, and confidence.
+Key Insight: The generator doesn't just ask "Convert this". It provides a "Field Reference Guide" based on the Logic Graph, explicitly telling the LLM which fields are Measures (don't wrap in SUM) and which are Columns (must wrap in SUM).
+
+Phase 5: High-Fidelity Validation (
+ValidationEngine
+)
+Goal: Prove functional equivalence between Tableau and DAX.
+
+Technical Implementation:
+
+Dual Execution Engine:
+Tableau Side: Executes the original formula against the Hyper extract (simulated via Pandas/Evaluator) to get the "Truth Value".
+DAX Side: Uses DuckDB to execute the generated DAX formula against the same data (mocking Power BI engine).
+Slice-Based Testing:
+Generates "Test Slices" (combinations of dimension filters, e.g., Region='East', Year=2023).
+Compares results for each slice.
+Error Categorization:
+PERFECT_MATCH: Delta < 1e-10.
+ROUNDING_ERROR: Relative error < 0.01%.
+CONTEXT_SHIFT: Large error (>10%) usually indicates a failed LOD or filter context translation.
+Self-Correction Loop:
+If validation fails, the engine feeds the error (e.g., "Value mismatch for Region=East") back to the LLM.
+The LLM generates a refined formula, which is re-validated.
+Phase 6 & 7: Model Build & Injection (
+PBIXInjector
+)
+Goal: Create the physical Power BI artifacts.
+
+Technical Implementation:
+
+Tabular Editor Scripting:
+The 
+PBIXInjector
+ generates C# scripts for Tabular Editor.
+These scripts utilize the TOM (Tabular Object Model) to programmatically:
+Create Tables and Columns.
+Create Measures with properties (Display Folder, Format String).
+Create Relationships (detecting cardinality from Phase 2 profiles).
+Injection:
+Runs TabularEditor.exe via subprocess to execute the C# script against a target PBIX file.
+Can create a PBIX "from scratch" (creating a blank model) or inject into an existing template.
+Technical Constraints & Future Improvements
+Profiling Scope: Currently profiles only the first table in a Hyper file. Needs expansion for multi-table schemas.
+Date Tables: Creation is currently manual or template-based; programmatic generation of full Date dimension via DAX/M is a planned enhancement.
+Complex LODs: Deeply nested LODs (FIXED inside INCLUDE) may require iterative decomposition logic rather than single-pass translation.
