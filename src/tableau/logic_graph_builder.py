@@ -243,6 +243,10 @@ class LogicGraphBuilder:
         # Step 4: Calculate dependency levels
         self._calculate_dependency_levels()
 
+        # Step 4.5: Refine calculation types based on validated dependencies
+        # (e.g., if a calc depends on a MEASURE, it is likely a MEASURE even without explicit aggregation keywords)
+        self._refine_calculation_types()
+
         # Step 5: Extract visual context
         self._extract_visual_contexts()
 
@@ -251,6 +255,61 @@ class LogicGraphBuilder:
 
         logger.info(f"Built graph with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges")
         return self.graph
+
+    def _refine_calculation_types(self):
+        """
+        Refine calculation types based on dependencies (Topological Pass)
+
+        Fixes issue where `[Measure1] + [Measure2]` is classified as CALCULATED_COLUMN
+        because it lacks explicit aggregation keywords like SUM().
+        """
+        try:
+            sorted_nodes = list(nx.topological_sort(self.graph))
+        except nx.NetworkXError:
+            logger.warning("Graph cycle detected - skipping type refinement")
+            return
+
+        for node_name in sorted_nodes:
+            if node_name not in self.calculations:
+                continue
+            
+            node = self.calculations[node_name]
+            
+            # Skip if already explicit types
+            if node.calc_type in (CalculationType.LOD_EXPRESSION, CalculationType.TABLE_CALCULATION, CalculationType.PARAMETER):
+                continue
+
+            # Check dependencies
+            has_measure_dependency = False
+            for dep_name in node.depends_on:
+                if dep_name in self.calculations:
+                    dep_node = self.calculations[dep_name]
+                    if dep_node.calc_type in (CalculationType.MEASURE, CalculationType.LOD_EXPRESSION, CalculationType.TABLE_CALCULATION):
+                        has_measure_dependency = True
+                        break
+                elif dep_name in self.base_field_metadata:
+                    # Base fields used without aggregation in a formula that lacks aggregation keywords
+                    # imply a row-level calculation (Calculated Column).
+                    # So we purposefully do NOT upgrade to MEASURE here.
+                    pass
+
+            # Update type if it's currently a Column but depends on Measures
+            if node.calc_type == CalculationType.CALCULATED_COLUMN and has_measure_dependency:
+                logger.info(f"Refining type for '{node.name}': CALCULATED_COLUMN -> MEASURE (depends on measures)")
+                node.calc_type = CalculationType.MEASURE
+                
+                # CRITICAL Propagate this change to dependents!
+                # Successors need to know this is now a MEASURE so they don't wrap it in SUM()
+                successors = list(self.graph.successors(node_name))
+                for succ_name in successors:
+                    if succ_name in self.calculations:
+                        succ_node = self.calculations[succ_name]
+                        if node_name in succ_node.depends_on_metadata:
+                            dep = succ_node.depends_on_metadata[node_name]
+                            dep.field_type = "CALCULATED_MEASURE"
+                            dep.is_aggregated = True
+                            logger.debug(f"  -> Updated dependency in '{succ_name}' to CALCULATED_MEASURE")
+
 
     def _add_calculation_node(self, calc: CalculatedField):
         """Add a calculation node to the graph"""
