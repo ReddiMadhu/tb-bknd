@@ -324,11 +324,15 @@ class DAXGenerator:
         prompt = f"""<system>
 You are an expert Power BI consultant specializing in converting Tableau calculations to DAX.
 You have deep knowledge of both Tableau's order of operations and DAX's filter context mechanics.
+
+**CRITICAL REQUIREMENT: You MUST respond with ONLY valid JSON. No markdown, no code blocks, no explanatory text.**
+**Your entire response must be a single JSON object starting with {{ and ending with }}.**
+**Do NOT include ```json or ``` or any other formatting. Just pure JSON.**
 </system>
 
 <task>
 Convert the Tableau calculation below to optimized, production-ready DAX.
-Follow the step-by-step analysis process, then output valid JSON.
+Follow the step-by-step analysis process, then output valid JSON ONLY.
 </task>
 
 <input>
@@ -406,7 +410,13 @@ Step 5: VALIDATE
 </critical_rules>
 
 <output_format>
-Return ONLY this JSON structure (no code blocks, no extra text):
+**YOUR RESPONSE MUST BE PURE JSON ONLY:**
+- NO markdown code blocks (don't use ```json)
+- NO explanatory text before or after the JSON
+- Start immediately with {{ and end with }}
+- The JSON must be parseable by Python json.loads()
+
+Required JSON structure:
 
 {{
   "dax_formula": "{'Column Name' if dax_type == 'CALCULATED_COLUMN' else 'Measure Name'} = [complete DAX formula]",
@@ -426,7 +436,8 @@ Return ONLY this JSON structure (no code blocks, no extra text):
 </confidence_scale>
 
 Now convert the calculation above to DAX following all steps and rules.
-Output valid JSON only:
+
+**REMINDER: Output ONLY raw JSON. Start with {{ and end with }}. No markdown, no code blocks.**
 """
 
         return prompt

@@ -37,17 +37,20 @@ class LLMReasoner:
         # Initialize LangChain LLM
         try:
             from langchain_openai import ChatOpenAI
-            
+
             self.llm = ChatOpenAI(
                 model=self.deployment,
                 api_key=self.api_key,
                 base_url=self.endpoint,
                 temperature=Config.LLM_TEMPERATURE,
-                max_tokens=Config.LLM_MAX_TOKENS
+                max_tokens=Config.LLM_MAX_TOKENS,
+                model_kwargs={
+                    "response_format": {"type": "json_object"}  # FORCE JSON MODE
+                }
             )
-            
-            logger.debug(f"LLM initialized: {self.deployment}")
-            
+
+            logger.debug(f"LLM initialized with JSON mode: {self.deployment}")
+
         except ImportError:
             logger.error("langchain-openai not installed. Run: pip install langchain-openai")
         except Exception as e:
