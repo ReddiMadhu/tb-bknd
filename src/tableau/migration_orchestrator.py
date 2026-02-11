@@ -395,9 +395,28 @@ class MigrationOrchestrator:
             all_lod_expressions.extend(wb.get("lod_expressions", []))
             all_worksheets.extend(wb.get("worksheets", []))
 
-            # Extract base field names from data sources
-            for ds in wb.get("data_sources", []):
-                base_fields.update(ds.tables)
+            # Extract base field names from Hyper extract columns
+            for hyper_path in wb.get("hyper_files", []):
+                try:
+                    from src.tableau.hyper_profiler import HyperDataProfiler
+
+                    profiler = HyperDataProfiler(str(hyper_path))
+                    tables = profiler.list_tables()
+
+                    # Get columns from all tables
+                    for table in tables:
+                        columns = profiler.get_columns(table)
+                        # Extract column names
+                        column_names = [col["name"] for col in columns]
+                        base_fields.update(column_names)
+
+                        logger.debug(f"Extracted {len(column_names)} base columns from {table}")
+
+                except Exception as e:
+                    logger.warning(f"Failed to extract columns from {hyper_path}: {e}")
+                    # Fallback: try to get from data sources
+                    for ds in wb.get("data_sources", []):
+                        base_fields.update(ds.tables)  # Just table names as fallback
 
         # Build graph
         graph_builder = LogicGraphBuilder()
