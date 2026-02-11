@@ -133,28 +133,29 @@ class LogicGraphBuilder:
         calculated_fields: List[CalculatedField],
         lod_expressions: List[LODExpression],
         worksheets: List[Worksheet],
-        base_field_names: Set[str]
+        base_field_metadata: Dict[str, Dict[str, Any]]
     ) -> nx.DiGraph:
         """
         Build the dependency graph
-
+        
         Args:
             calculated_fields: All calculated fields
             lod_expressions: All LOD expressions
             worksheets: All worksheets (for visual context)
-            base_field_names: Set of non-calculated field names
-
+            base_field_metadata: Metadata for base fields (name -> {type, generic_type})
+            
         Returns:
             NetworkX directed graph
         """
         logger.info(f"Building logic graph from {len(calculated_fields)} calculations")
-
-        self.base_fields = base_field_names
+        
+        self.base_field_metadata = base_field_metadata
+        self.base_fields = set(base_field_metadata.keys())
         self.worksheets = worksheets
-
-        if not base_field_names:
-            logger.error(f"⚠️  CRITICAL: base_field_names is EMPTY! All fields will be UNKNOWN!")
-
+        
+        if not self.base_fields:
+            logger.error(f"⚠️  CRITICAL: base_fields is EMPTY! All fields will be UNKNOWN!")
+            
         # Build role map from calculated fields
         for calc in calculated_fields:
             self.field_roles[calc.name] = calc.role  # "measure" or "dimension"
@@ -180,11 +181,18 @@ class LogicGraphBuilder:
             depends_on_metadata = {}
             for dep in dependencies:
                 if dep in self.base_fields:
-                    # Base column from data source
+                    # Base column from data source - use enhanced metadata
+                    metadata = self.base_field_metadata.get(dep, {})
+                    generic_type = metadata.get("generic_type", "UNKNOWN")
+                    
+                    # Heuristic: Numeric = Potential Measure, String/Date = Dimension
+                    # This allows DAX Generator to wrap numeric fields in SUM() while leaving dimensions alone
+                    role = "measure" if generic_type == "NUMERIC" else "dimension"
+                    
                     depends_on_metadata[dep] = FieldDependency(
                         field_name=dep,
                         field_type="BASE_COLUMN",
-                        original_role="dimension",  # Base fields are typically dimensions
+                        original_role=role, 
                         is_aggregated=False,
                         source_calc=None
                     )

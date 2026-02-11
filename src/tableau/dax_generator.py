@@ -713,10 +713,13 @@ See model enhancement guidance.
 
                 # Determine wrapping strategy
                 if dep.field_type == "BASE_COLUMN":
+                    # Check original role (measure vs dimension)
+                    is_measure = dep.original_role == "measure"
+                    
                     result[field_name] = {
                         "type": "base_column",
-                        "wrap_in_aggregation": True,
-                        "reason": "Physical column from data source"
+                        "wrap_in_aggregation": is_measure,
+                        "reason": f"Physical column (role={dep.original_role})"
                     }
                 elif dep.field_type == "CALCULATED_MEASURE":
                     result[field_name] = {
@@ -771,9 +774,9 @@ See model enhancement guidance.
             field_type = metadata["type"]
 
             if wrap:
-                dax_usage = f"SUM({{table}}[{field_name}])"
+                dax_usage = f"SUM({{table}}[{field_name}]) (or AVG/MIN/MAX)"
             else:
-                dax_usage = f"[{field_name}]"
+                dax_usage = f"[{field_name}] (DO NOT WRAP)"
 
             lines.append(f"""  <field name="{field_name}">
     <type>{field_type}</type>

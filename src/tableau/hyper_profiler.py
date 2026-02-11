@@ -570,7 +570,8 @@ class HyperDataProfiler:
                         for col in schema.columns:
                             columns.append({
                                 "name": col.name.unescaped,
-                                "data_type": str(col.type)
+                                "data_type": str(col.type),
+                                "generic_type": self._map_hyper_type_to_generic(str(col.type))
                             })
 
                     logger.debug(f"Extracted {len(columns)} columns from {table_name} using direct query")
@@ -596,7 +597,8 @@ class HyperDataProfiler:
                             for row in result:
                                 columns.append({
                                     "name": row[0],
-                                    "data_type": row[1]
+                                    "data_type": row[1],
+                                    "generic_type": self._map_hyper_type_to_generic(row[1])
                                 })
 
                         logger.debug(f"Extracted {len(columns)} columns from {table_name} using information_schema")
@@ -605,6 +607,21 @@ class HyperDataProfiler:
                     except Exception as e2:
                         logger.error(f"Both methods failed to get columns from {table_name}: {e2}")
                         return []
+
+    def _map_hyper_type_to_generic(self, hyper_type: str) -> str:
+        """Map Hyper SQL type to generic type (NUMERIC, STRING, DATE, BOOL)"""
+        hyper_type = hyper_type.upper()
+        
+        if any(x in hyper_type for x in ["INT", "DOUBLE", "NUMERIC", "DECIMAL", "REAL", "FLOAT"]):
+            return "NUMERIC"
+        elif any(x in hyper_type for x in ["CHAR", "TEXT", "STRING"]):
+            return "STRING"
+        elif any(x in hyper_type for x in ["DATE", "TIME", "TIMESTAMP"]):
+            return "DATETIME"
+        elif "BOOL" in hyper_type:
+            return "BOOLEAN"
+        
+        return "UNKNOWN"
 
     def _get_columns_duckdb(self, table_name: str) -> List[Dict[str, str]]:
         """Get columns using DuckDB (fallback)"""

@@ -396,7 +396,7 @@ class MigrationOrchestrator:
         all_calculations = []
         all_lod_expressions = []
         all_worksheets = []
-        base_fields = set()
+        base_field_metadata = {}
 
         for wb in workbooks_data:
             all_calculations.extend(wb.get("calculated_fields", []))
@@ -412,7 +412,9 @@ class MigrationOrchestrator:
                 logger.warning(f"   Falling back to extracting table names from data sources")
                 # Fallback: try to get from data sources
                 for ds in wb.get("data_sources", []):
-                    base_fields.update(ds.tables)
+                    # For fallback, we just mark as UNKNOWN type
+                    for table in ds.tables:
+                        base_field_metadata[table] = {"name": table, "generic_type": "UNKNOWN"}
                     logger.info(f"   Added {len(ds.tables)} table names: {ds.tables}")
                 continue
 
@@ -428,10 +430,12 @@ class MigrationOrchestrator:
                     # Get columns from all tables
                     for table in tables:
                         columns = profiler.get_columns(table)
-                        # Extract column names
+                        # Extract column names and metadata
+                        for col in columns:
+                            col_name = col["name"]
+                            base_field_metadata[col_name] = col
+                            
                         column_names = [col["name"] for col in columns]
-                        base_fields.update(column_names)
-
                         logger.info(f"✅ Extracted {len(column_names)} base columns from {table}")
 
                         # Also add aliased versions (for multi-table scenarios)
@@ -446,21 +450,23 @@ class MigrationOrchestrator:
                         # Add aliased column names: "Amount" -> "Amount (Fees)"
                         for col_name in column_names:
                             aliased_name = f"{col_name} ({clean_table_name})"
-                            base_fields.add(aliased_name)
+                            # Use same metadata for aliased version
+                            base_field_metadata[aliased_name] = base_field_metadata[col_name]
 
                 except Exception as e:
                     logger.error(f"❌ Failed to extract columns from {hyper_path}: {e}")
                     logger.error(f"   Falling back to table names only")
                     # Fallback: try to get from data sources
                     for ds in wb.get("data_sources", []):
-                        base_fields.update(ds.tables)  # Just table names as fallback
-                        logger.warning(f"   Fallback: Added table names: {ds.tables}")
+                         for table in ds.tables:
+                            base_field_metadata[table] = {"name": table, "generic_type": "UNKNOWN"}
+                         logger.warning(f"   Fallback: Added table names: {ds.tables}")
 
         # Log final base_fields summary
-        logger.info(f"🎯 BASE FIELDS REGISTRY COMPLETE: {len(base_fields)} total fields")
-        if base_fields:
-            sample_fields = list(base_fields)[:15]
-            logger.info(f"   Sample fields: {', '.join(sample_fields)}{'...' if len(base_fields) > 15 else ''}")
+        logger.info(f"🎯 BASE FIELDS REGISTRY COMPLETE: {len(base_field_metadata)} total fields")
+        if base_field_metadata:
+            sample_fields = list(base_field_metadata.keys())[:15]
+            logger.info(f"   Sample fields: {', '.join(sample_fields)}{'...' if len(base_field_metadata) > 15 else ''}")
         else:
             logger.error(f"⚠️  WARNING: No base fields found! All dependencies will be marked UNKNOWN!")
 
@@ -471,7 +477,7 @@ class MigrationOrchestrator:
             calculated_fields=all_calculations,
             lod_expressions=all_lod_expressions,
             worksheets=all_worksheets,
-            base_field_names=base_fields
+            base_field_metadata=base_field_metadata
         )
 
         # Store calculations in database
