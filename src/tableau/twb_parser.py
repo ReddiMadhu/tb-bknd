@@ -436,20 +436,43 @@ class TableauTWBParser:
                 for f in ws.xpath(".//filter")
             ]
 
-            # NEW: Detect visual type
-            visual_type, mark_type = self._detect_visual_type(ws, rows_fields, columns_fields, marks_fields)
+            # NEW: Detect basic chart type from XML (Mark class)
+            # This replaces the complex _detect_visual_type logic with the simpler reference logic
+            basic_chart_type = self._detect_basic_chart_type(ws)
             
-            # NEW: Extract detailed fields and axes using reference logic
-            dimensions, measures, axes = self._extract_detailed_metadata(ws, visual_type.value if visual_type else "Automatic")
+            # NEW: Extract detailed fields and implicit axes
+            dimensions, measures = self._extract_detailed_fields(ws)
+            
+            # Use user's logic to refine visual type
+            visual_type_str = self._infer_visual_type(basic_chart_type, dimensions, measures)
+            
+            # Map string back to Enum if possible, or use as value
+            # The Worksheet dataclass expects VisualType enum, but we might need to be flexible or map it.
+            # For now, let's try to map known ones, or default to UNKNOWN and store the string in mark_type or a new field.
+            # actually, VisualType is an Enum. Let's see if we can map common ones.
+            try:
+                visual_type = VisualType(visual_type_str.lower())
+            except ValueError:
+                # If not in Enum (e.g. "Automatic", "Table"), map to closest or UNKNOWN
+                if visual_type_str == "Table":
+                    visual_type = VisualType.TEXT_TABLE
+                elif visual_type_str == "Map":
+                    visual_type = VisualType.MAP
+                else:
+                    visual_type = VisualType.UNKNOWN
+
+            # Re-extract instance map for axes inference
+            instance_map = self._extract_column_instance_map(ws)
+            axes = self._infer_axes(visual_type_str, dimensions, measures, instance_map)
 
             worksheet = Worksheet(
                 name=name,
-                visual_type=visual_type,  # NEW
+                visual_type=visual_type, 
                 rows_fields=rows_fields,
                 columns_fields=columns_fields,
                 marks_fields=marks_fields,
                 filters=filters,
-                mark_type=mark_type,  # NEW
+                mark_type=visual_type_str, # Store the inferred string here for API
                 dimensions=dimensions,
                 measures=measures,
                 axes=axes
@@ -666,15 +689,28 @@ class TableauTWBParser:
                 
         return mapping
 
-    def _extract_detailed_metadata(self, ws_elem, chart_type: str):
-        """Extract dimensions, measures and infer axes"""
+    def _detect_basic_chart_type(self, ws_elem):
+        """Detect basic chart type from mark class (Reference Logic)"""
+        # mark = ws.find("./pane/mark") -> in lxml xpath this is ./table/view/pane/mark or similar?
+        # The reference code uses `ws.find("./pane/mark")`. 
+        # In TWB XML, <worksheet> has <table> -> <view> -> <pane> -> <mark> usually?
+        # Or <worksheet> -> <table> -> <pane> ?
+        # Let's check typical structure. Usually it is worksheet/table/view OR worksheet/table/panes/pane
+        # The reference code implies direct child. Let's try to match reference logic using .// which is safer
+        
+        marks = ws_elem.xpath(".//pane/mark")
+        if marks:
+            return marks[0].get("class", "Unknown")
+        return "Automatic" # Ref says "Unknown" but fallback in infer_visual_type is "Automatic"
+
+    def _extract_detailed_fields(self, ws_elem):
+        """Extract dimensions and measures (Reference Logic)"""
         dimensions = set()
         measures = set()
         
         instance_map = self._extract_column_instance_map(ws_elem)
         
-        # 1. Pane encodings (recursively find encodings)
-        # Usually table/panes/pane/encodings
+        # 1. Pane encodings
         for enc in ws_elem.xpath(".//pane/encodings/*"):
             col_ref = enc.get("column")
             if not col_ref:
@@ -689,32 +725,26 @@ class TableauTWBParser:
                 elif meta["role"] == "measure":
                     measures.add(meta["base_column"])
             else:
-                 # Fallback: if not in instance map, try to infer from name
-                 # e.g. [sum:Sales:qk] -> Sales
+                 # Fallback for when instance map miss
                  if ":" in clean:
                      parts = clean.split(":")
                      if len(parts) >= 2:
                          potential_name = parts[1]
-                         measures.add(potential_name) # Heuristic: derived fields in encodings often measures
+                         measures.add(potential_name)
 
-        # 2. Rows shelf (recursively)
+        # 2. Rows shelf
         for field in ws_elem.xpath(".//rows//field"):
-            fname = field.get("name") # In shelf, it's often 'name' not 'field' attribute in some contexts, but let's check
-            if not fname:
-                fname = field.get("field") # Or 'field'
-                
-            if fname:
-                clean_name = fname.strip("[]")
-                dimensions.add(clean_name)
-                
-        # 3. Columns shelf (recursively)
-        for field in ws_elem.xpath(".//columns//field"): # XPath was table/view/cols/field, but .//columns//field is safer/consistent with parse_worksheets
             fname = field.get("name") or field.get("field")
             if fname:
-                clean_name = fname.strip("[]")
-                measures.add(clean_name)
+                dimensions.add(fname.strip("[]"))
+                
+        # 3. Columns shelf
+        for field in ws_elem.xpath(".//columns//field"):
+            fname = field.get("name") or field.get("field")
+            if fname:
+                measures.add(fname.strip("[]"))
         
-        # 4. LAST RESORT: datasource-dependencies (implicit axes)
+        # 4. LAST RESORT
         if not dimensions and not measures:
             for meta in instance_map.values():
                 if meta["role"] == "dimension":
@@ -722,13 +752,29 @@ class TableauTWBParser:
                 elif meta["role"] == "measure":
                     measures.add(meta["base_column"])
         
-        dim_list = sorted(list(dimensions))
-        meas_list = sorted(list(measures))
+        return sorted(list(dimensions)), sorted(list(measures))
+
+    def _infer_visual_type(self, chart_type, dimensions, measures):
+        """Infer visual type based on dimensions and measures (User provided logic)"""
+        # Note: The user code uses `chart_type == "Automatic"`.
+        # Our parser might return "automatic" or "unknown" or even VisualType enum values stringified.
+        # We need to bridge that gap. Let's assume chart_type passed here is a string.
         
-        # Infer Axes
-        axes = self._infer_axes(chart_type, dim_list, meas_list, instance_map)
-        
-        return dim_list, meas_list, axes
+        # Normalize slightly for robustness, but stick close to user logic
+        ct_str = str(chart_type)
+        if ct_str == "Automatic" or ct_str == "automatic":
+            geo_keywords = ["state", "province", "country", "city", "latitude", "longitude"]
+
+            for dim in dimensions:
+                if any(k in dim.lower() for k in geo_keywords):
+                    return "Map"
+
+            if dimensions and measures:
+                return "Table"
+
+            return "Automatic"
+        else:
+            return chart_type
 
     def _infer_axes(self, chart_type, dimensions, measures, column_map):
         columns = None
