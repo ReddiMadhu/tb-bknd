@@ -549,27 +549,62 @@ class HyperDataProfiler:
 
     def _get_columns_hyper(self, table_name: str) -> List[Dict[str, str]]:
         """Get columns using Hyper API"""
-        with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
+        try:
+            telemetry = Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU
+        except AttributeError:
+            telemetry = Telemetry.SEND_USAGE_DATA_TO_TABLEAU
+
+        with HyperProcess(telemetry=telemetry) as hyper:
             with Connection(hyper.endpoint, str(self.hyper_file)) as connection:
-                parts = table_name.split(".")
-                schema = parts[0] if len(parts) > 1 else "Extract"
-                table = parts[-1]
+                # Strip quotes from table name if present
+                clean_table = table_name.strip('"')
 
-                # Query information schema
-                query = f"""
-                    SELECT column_name, data_type
-                    FROM information_schema.columns
-                    WHERE table_schema = '{schema}' AND table_name = '{table}'
-                """
+                # Try method 1: Query LIMIT 0 to get column metadata
+                try:
+                    query = f'SELECT * FROM {table_name} LIMIT 0'
+                    columns = []
 
-                columns = []
-                with connection.execute_query(query) as result:
-                    for row in result:
-                        columns.append({
-                            "name": row[0],
-                            "data_type": row[1]
-                        })
-                return columns
+                    with connection.execute_query(query) as result:
+                        # Get column names from result metadata
+                        schema = result.schema
+                        for col in schema.columns:
+                            columns.append({
+                                "name": col.name.unescaped,
+                                "data_type": str(col.type)
+                            })
+
+                    logger.debug(f"Extracted {len(columns)} columns from {table_name} using direct query")
+                    return columns
+
+                except Exception as e:
+                    logger.warning(f"Direct query failed for {table_name}: {e}")
+
+                    # Fallback: Try information_schema (older Hyper files)
+                    try:
+                        parts = clean_table.split(".")
+                        schema_name = parts[0] if len(parts) > 1 else "Extract"
+                        table_only = parts[-1]
+
+                        query = f"""
+                            SELECT column_name, data_type
+                            FROM information_schema.columns
+                            WHERE table_schema = '{schema_name}' AND table_name = '{table_only}'
+                        """
+
+                        columns = []
+                        with connection.execute_query(query) as result:
+                            for row in result:
+                                columns.append({
+                                    "name": row[0],
+                                    "data_type": row[1]
+                                })
+
+                        logger.debug(f"Extracted {len(columns)} columns from {table_name} using information_schema")
+                        return columns
+
+                    except Exception as e2:
+                        logger.error(f"Both methods failed to get columns from {table_name}: {e2}")
+                        return []
 
     def _get_columns_duckdb(self, table_name: str) -> List[Dict[str, str]]:
         """Get columns using DuckDB (fallback)"""

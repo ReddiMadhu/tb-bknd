@@ -152,6 +152,9 @@ class LogicGraphBuilder:
         self.base_fields = base_field_names
         self.worksheets = worksheets
 
+        if not base_field_names:
+            logger.error(f"⚠️  CRITICAL: base_field_names is EMPTY! All fields will be UNKNOWN!")
+
         # Build role map from calculated fields
         for calc in calculated_fields:
             self.field_roles[calc.name] = calc.role  # "measure" or "dimension"
@@ -213,6 +216,7 @@ class LogicGraphBuilder:
                         is_aggregated=False,
                         source_calc=None
                     )
+                    logger.warning(f"❌ {dep} → UNKNOWN (not in base_fields or calculations!)")
 
             # Store metadata in node
             node.depends_on_metadata = depends_on_metadata

@@ -228,6 +228,14 @@ class MigrationOrchestrator:
             dashboards = parser.parse_dashboards()
             data_sources = parser.parse_data_sources()
 
+            # DEBUG: Log Hyper files extracted
+            logger.info(f"📦 Extracted {len(parser.hyper_files)} Hyper files from TWBX")
+            if parser.hyper_files:
+                for hf in parser.hyper_files:
+                    logger.info(f"   - {hf}")
+            else:
+                logger.warning(f"⚠️  No Hyper files found in {Path(twbx_path).name}")
+
             # Store workbook metadata
             workbook_id = f"wb_{uuid.uuid4().hex[:8]}"
 
@@ -396,12 +404,26 @@ class MigrationOrchestrator:
             all_worksheets.extend(wb.get("worksheets", []))
 
             # Extract base field names from Hyper extract columns
-            for hyper_path in wb.get("hyper_files", []):
+            hyper_files = wb.get("hyper_files", [])
+            logger.info(f"🔍 Extracting base fields from {len(hyper_files)} Hyper files...")
+
+            if not hyper_files:
+                logger.warning(f"⚠️  Workbook '{wb.get('filename')}' has no Hyper files!")
+                logger.warning(f"   Falling back to extracting table names from data sources")
+                # Fallback: try to get from data sources
+                for ds in wb.get("data_sources", []):
+                    base_fields.update(ds.tables)
+                    logger.info(f"   Added {len(ds.tables)} table names: {ds.tables}")
+                continue
+
+            for hyper_path in hyper_files:
                 try:
                     from src.tableau.hyper_profiler import HyperDataProfiler
 
+                    logger.info(f"📂 Profiling Hyper file: {hyper_path}")
                     profiler = HyperDataProfiler(str(hyper_path))
                     tables = profiler.list_tables()
+                    logger.info(f"📊 Found {len(tables)} tables: {tables}")
 
                     # Get columns from all tables
                     for table in tables:
@@ -410,13 +432,37 @@ class MigrationOrchestrator:
                         column_names = [col["name"] for col in columns]
                         base_fields.update(column_names)
 
-                        logger.debug(f"Extracted {len(column_names)} base columns from {table}")
+                        logger.info(f"✅ Extracted {len(column_names)} base columns from {table}")
+
+                        # Also add aliased versions (for multi-table scenarios)
+                        # Extract clean table name from full path: "Extract"."Fees_XXX" -> "Fees"
+                        table_parts = table.strip('"').split(".")
+                        table_name = table_parts[-1] if table_parts else table
+                        # Strip any remaining quotes from table name
+                        table_name = table_name.strip('"')
+                        # Remove UUID suffix: "Fees_762A3DD4A32A4BEC8ACBE302CE7DD2BF" -> "Fees"
+                        clean_table_name = table_name.split("_")[0] if "_" in table_name else table_name
+
+                        # Add aliased column names: "Amount" -> "Amount (Fees)"
+                        for col_name in column_names:
+                            aliased_name = f"{col_name} ({clean_table_name})"
+                            base_fields.add(aliased_name)
 
                 except Exception as e:
-                    logger.warning(f"Failed to extract columns from {hyper_path}: {e}")
+                    logger.error(f"❌ Failed to extract columns from {hyper_path}: {e}")
+                    logger.error(f"   Falling back to table names only")
                     # Fallback: try to get from data sources
                     for ds in wb.get("data_sources", []):
                         base_fields.update(ds.tables)  # Just table names as fallback
+                        logger.warning(f"   Fallback: Added table names: {ds.tables}")
+
+        # Log final base_fields summary
+        logger.info(f"🎯 BASE FIELDS REGISTRY COMPLETE: {len(base_fields)} total fields")
+        if base_fields:
+            sample_fields = list(base_fields)[:15]
+            logger.info(f"   Sample fields: {', '.join(sample_fields)}{'...' if len(base_fields) > 15 else ''}")
+        else:
+            logger.error(f"⚠️  WARNING: No base fields found! All dependencies will be marked UNKNOWN!")
 
         # Build graph
         graph_builder = LogicGraphBuilder()
