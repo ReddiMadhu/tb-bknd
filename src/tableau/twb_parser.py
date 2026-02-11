@@ -5,7 +5,7 @@ import os
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from lxml import etree
 from io import BytesIO
 from loguru import logger
@@ -82,6 +82,9 @@ class Worksheet:
     marks_fields: List[str]
     filters: List[str]
     mark_type: str = "automatic"  # bar, line, text, etc.
+    dimensions: List[str] = field(default_factory=list)
+    measures: List[str] = field(default_factory=list)
+    axes: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -406,8 +409,22 @@ class TableauTWBParser:
             columns_fields = self._extract_shelf_fields(ws, ".//columns//field")
 
             # Extract fields from marks (color, size, label, etc.)
+            # Extract fields from marks (color, size, label, etc.)
             marks_fields = []
             for encoding in ws.xpath(".//encoding"):
+                # Case 1: Column as attribute (e.g. <encoding attr='color' column='[calc]' />)
+                col_attr = encoding.get("column")
+                if col_attr:
+                    # Clean up: [sum:Calculation_...] -> Calculation_...
+                    cleaned = col_attr.split(":")[-1].strip("[]")
+                    # Or simple strip if no colons
+                    if ":" not in col_attr:
+                        cleaned = col_attr.strip("[]")
+                    
+                    if cleaned and cleaned not in marks_fields:
+                        marks_fields.append(cleaned)
+
+                # Case 2: Field as child element
                 for field_elem in encoding.xpath(".//field"):
                     field_name = field_elem.get("name", "").strip("[]")
                     if field_name and field_name not in marks_fields:
@@ -421,6 +438,9 @@ class TableauTWBParser:
 
             # NEW: Detect visual type
             visual_type, mark_type = self._detect_visual_type(ws, rows_fields, columns_fields, marks_fields)
+            
+            # NEW: Extract detailed fields and axes using reference logic
+            dimensions, measures, axes = self._extract_detailed_metadata(ws, visual_type.value if visual_type else "Automatic")
 
             worksheet = Worksheet(
                 name=name,
@@ -429,7 +449,10 @@ class TableauTWBParser:
                 columns_fields=columns_fields,
                 marks_fields=marks_fields,
                 filters=filters,
-                mark_type=mark_type  # NEW
+                mark_type=mark_type,  # NEW
+                dimensions=dimensions,
+                measures=measures,
+                axes=axes
             )
 
             worksheets.append(worksheet)
@@ -611,6 +634,141 @@ class TableauTWBParser:
 
         logger.info(f"Parsed {len(data_sources)} data sources")
         return data_sources
+
+    # ============================================
+    # Detailed Metadata Extraction (New)
+    # ============================================
+
+    def _extract_column_instance_map(self, ws_elem) -> Dict[str, Dict[str, Any]]:
+        """Map column instances to base columns and roles"""
+        mapping = {}
+        
+        # Look for datasource-dependencies recursively
+        # Often under table/view/datasource-dependencies
+        for deps in ws_elem.xpath(".//datasource-dependencies"):
+            base_roles = {}
+            for col in deps.xpath("./column"):
+                base_name = col.get("name", "").strip("[]")
+                role = col.get("role")
+                base_roles[base_name] = role
+                
+            for ci in deps.xpath("./column-instance"):
+                instance = ci.get("name", "").strip("[]")
+                base_col = ci.get("column", "").strip("[]")
+                derivation = ci.get("derivation")
+                role = base_roles.get(base_col)
+                
+                mapping[instance] = {
+                    "base_column": base_col,
+                    "role": role,
+                    "derivation": derivation
+                }
+                
+        return mapping
+
+    def _extract_detailed_metadata(self, ws_elem, chart_type: str):
+        """Extract dimensions, measures and infer axes"""
+        dimensions = set()
+        measures = set()
+        
+        instance_map = self._extract_column_instance_map(ws_elem)
+        
+        # 1. Pane encodings (recursively find encodings)
+        # Usually table/panes/pane/encodings
+        for enc in ws_elem.xpath(".//pane/encodings/*"):
+            col_ref = enc.get("column")
+            if not col_ref:
+                continue
+                
+            clean = col_ref.split(".")[-1].strip("[]")
+            
+            if clean in instance_map:
+                meta = instance_map[clean]
+                if meta["role"] == "dimension":
+                    dimensions.add(meta["base_column"])
+                elif meta["role"] == "measure":
+                    measures.add(meta["base_column"])
+            else:
+                 # Fallback: if not in instance map, try to infer from name
+                 # e.g. [sum:Sales:qk] -> Sales
+                 if ":" in clean:
+                     parts = clean.split(":")
+                     if len(parts) >= 2:
+                         potential_name = parts[1]
+                         measures.add(potential_name) # Heuristic: derived fields in encodings often measures
+
+        # 2. Rows shelf (recursively)
+        for field in ws_elem.xpath(".//rows//field"):
+            fname = field.get("name") # In shelf, it's often 'name' not 'field' attribute in some contexts, but let's check
+            if not fname:
+                fname = field.get("field") # Or 'field'
+                
+            if fname:
+                clean_name = fname.strip("[]")
+                dimensions.add(clean_name)
+                
+        # 3. Columns shelf (recursively)
+        for field in ws_elem.xpath(".//columns//field"): # XPath was table/view/cols/field, but .//columns//field is safer/consistent with parse_worksheets
+            fname = field.get("name") or field.get("field")
+            if fname:
+                clean_name = fname.strip("[]")
+                measures.add(clean_name)
+        
+        # 4. LAST RESORT: datasource-dependencies (implicit axes)
+        if not dimensions and not measures:
+            for meta in instance_map.values():
+                if meta["role"] == "dimension":
+                    dimensions.add(meta["base_column"])
+                elif meta["role"] == "measure":
+                    measures.add(meta["base_column"])
+        
+        dim_list = sorted(list(dimensions))
+        meas_list = sorted(list(measures))
+        
+        # Infer Axes
+        axes = self._infer_axes(chart_type, dim_list, meas_list, instance_map)
+        
+        return dim_list, meas_list, axes
+
+    def _infer_axes(self, chart_type, dimensions, measures, column_map):
+        columns = None
+        rows = None
+        
+        if not dimensions and not measures:
+            return {
+                "columns": None,
+                "rows": None,
+            }
+            
+        # Simplified logic from reference
+        # Note: Chart type detection in reference might return "Automatic", "Map", "Table"
+        # In our parser we have visual_type returning ENUM strings like "bar", "text_table", etc.
+        # We might need to map or strictly use the passed chart_type.
+        
+        # The reference logic:
+        # if chart_type in ("Area", "Line", "Bar"):
+        # We need to ensure chart_type is compatible.
+        
+        # Map our visual types to reference types if needed, or just check loosely
+        ct_lower = str(chart_type).lower()
+        is_cartesian = any(x in ct_lower for x in ["area", "line", "bar"])
+        
+        if is_cartesian:
+            for meta in column_map.values():
+                if meta.get("role") == "dimension" and meta.get("derivation") in ("Month", "Year", "Quarter"):
+                    columns = f"{meta['derivation']}({meta['base_column']})"
+                    break
+            
+            if not columns and dimensions:
+                columns = dimensions[0]
+                
+            if measures:
+                rows = f"SUM({measures[0]})"
+                
+        return {
+            "columns": columns,
+            "rows": rows,
+        }
 
     # ============================================
     # Utility Methods

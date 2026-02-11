@@ -121,8 +121,35 @@ async def get_workbook_worksheets(migration_id: str, workbook_id: str):
         parser = TableauTWBParser(workbook.file_path)
         worksheets_raw = parser.parse_worksheets()
 
-        worksheets = [
-            {
+        calculated_fields_raw = parser.parse_calculated_fields()
+        calc_map = {cf.name: cf for cf in calculated_fields_raw}
+
+        worksheets = []
+        for ws in worksheets_raw:
+            # Resolve measures
+            resolved_measures = []
+            for m in ws.measures:
+                if m in calc_map:
+                    cf = calc_map[m]
+                    resolved_measures.append({
+                        "type": "calculated",
+                        "name": cf.caption or cf.name,
+                        "formula": cf.formula
+                    })
+                else:
+                    resolved_measures.append({
+                        "type": "base_measure",
+                        "name": m
+                    })
+
+            worksheets.append({
+                "worksheet_name": str(ws.name) if ws.name else "",
+                "chart_type": str(ws.visual_type.value) if ws.visual_type else "Automatic",
+                "intro_chart_type": str(ws.visual_type.value) if ws.visual_type else "Automatic", # for UI consistent naming
+                "axes": ws.axes,
+                "dimensions": ws.dimensions,
+                "measures": resolved_measures,
+                # Legacy fields
                 "name": str(ws.name) if ws.name else "",
                 "visual_type": str(ws.visual_type.value) if ws.visual_type else "",
                 "mark_type": str(ws.mark_type) if ws.mark_type else "",
@@ -130,9 +157,7 @@ async def get_workbook_worksheets(migration_id: str, workbook_id: str):
                 "columns_fields": [str(f) for f in ws.columns_fields] if ws.columns_fields else [],
                 "marks_fields": [str(f) for f in ws.marks_fields] if ws.marks_fields else [],
                 "filters": [str(f) for f in ws.filters] if ws.filters else []
-            }
-            for ws in worksheets_raw
-        ]
+            })
 
         return {
             "workbook_id": workbook_id,
@@ -407,10 +432,38 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                 # Parse TWB file
                 parser = TableauTWBParser(workbook.file_path)
 
+                # Extract calculated fields first (needed for resolving measures)
+                calculated_fields_raw = parser.parse_calculated_fields()
+                calc_map = {cf.name: cf for cf in calculated_fields_raw}
+
                 # Extract worksheets
                 worksheets_raw = parser.parse_worksheets()
-                worksheets = [
-                    {
+
+                worksheets = []
+                for ws in worksheets_raw:
+                    # Resolve measures
+                    resolved_measures = []
+                    for m in ws.measures:
+                        if m in calc_map:
+                            cf = calc_map[m]
+                            resolved_measures.append({
+                                "type": "calculated",
+                                "name": cf.caption or cf.name,
+                                "formula": cf.formula
+                            })
+                        else:
+                            resolved_measures.append({
+                                "type": "base_measure",
+                                "name": m
+                            })
+
+                    worksheets.append({
+                        "worksheet_name": str(ws.name) if ws.name else "",
+                        "chart_type": str(ws.visual_type.value) if ws.visual_type else "Automatic",
+                        "axes": ws.axes,
+                        "dimensions": ws.dimensions,
+                        "measures": resolved_measures,
+                        # Legacy fields
                         "name": str(ws.name) if ws.name else "",
                         "visual_type": str(ws.visual_type.value) if ws.visual_type else "",
                         "mark_type": str(ws.mark_type) if ws.mark_type else "",
@@ -418,10 +471,8 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                         "columns_fields": [str(f) for f in ws.columns_fields] if ws.columns_fields else [],
                         "marks_fields": [str(f) for f in ws.marks_fields] if ws.marks_fields else [],
                         "filters": [str(f) for f in ws.filters] if ws.filters else []
-                    }
-                    for ws in worksheets_raw
-                ]
-
+                    })
+                
                 # Extract dashboards
                 dashboards_raw = parser.parse_dashboards()
                 dashboards = [
@@ -431,9 +482,6 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                     }
                     for db in dashboards_raw
                 ]
-
-                # Extract calculated fields
-                calculated_fields_raw = parser.parse_calculated_fields()
 
                 # Deduplicate calculated fields by name (same field often appears in multiple data sources)
                 seen_calc_names = set()
