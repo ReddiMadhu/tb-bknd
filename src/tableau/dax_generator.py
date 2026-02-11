@@ -188,6 +188,14 @@ class DAXGenerator:
             indent=2
         )
 
+        # NEW: Parse referenced fields and build guide
+        referenced_fields = self._parse_field_references(
+            calc_node.formula,
+            calc_node.depends_on_metadata or {}  # Use the metadata from LogicGraphBuilder
+        )
+
+        field_reference_guide = self._build_field_reference_guide(referenced_fields)
+
         # Build prompt
         prompt = self._build_conversion_prompt(
             tableau_formula=calc_node.formula,
@@ -196,7 +204,8 @@ class DAXGenerator:
             visual_context=visual_context,
             data_profile=data_profile or {},
             patterns_json=patterns_json,
-            table_name=table_name
+            table_name=table_name,
+            field_reference_guide=field_reference_guide  # NEW parameter
         )
 
         # Call LLM
@@ -224,7 +233,8 @@ class DAXGenerator:
         visual_context: Dict[str, Any],
         data_profile: Dict[str, Any],
         patterns_json: str,
-        table_name: str
+        table_name: str,
+        field_reference_guide: str = ""  # NEW: Default to empty for backward compatibility
     ) -> str:
         """Build the LLM prompt for DAX generation with full visual context"""
 
@@ -342,6 +352,8 @@ Follow the step-by-step analysis process, then output valid JSON.
 </detection>
 </input>
 
+{field_reference_guide}
+
 <conversion_patterns>
 {patterns_json}
 </conversion_patterns>
@@ -383,7 +395,9 @@ Step 5: VALIDATE
 </instructions>
 
 <critical_rules>
-{'✓ NO aggregation wrappers (Sales[A] + Sales[B], not SUM)' if dax_type == 'CALCULATED_COLUMN' else '✓ ALWAYS wrap in aggregation (SUM(Sales[A]) + SUM(Sales[B]))'}
+✓ Refer to <field_references> above for wrapping guidance per field
+{'✓ NO aggregation wrappers (Sales[A] + Sales[B], not SUM)' if dax_type == 'CALCULATED_COLUMN' else '✓ Base columns MUST be wrapped: SUM(Sales[ColumnName])'}
+✓ Calculated measures MUST NOT be wrapped: [MeasureName]
 ✓ Use DIVIDE(a, b, 0) not a/b
 ✓ Always specify table: {table_name}[Column]
 ✓ Return complete formula (no truncation)
@@ -652,6 +666,113 @@ See model enhancement guidance.
             "requires_all": transition.requires_all,
             "requires_keepfilters": transition.requires_keepfilters
         }
+
+    def _parse_field_references(
+        self,
+        formula: str,
+        dependency_metadata: Dict[str, Any]
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Parse all [FieldName] references and annotate with metadata
+
+        Returns:
+            {
+                "Net Profit": {
+                    "type": "calculated_measure",
+                    "wrap_in_aggregation": False,
+                    "reason": "Already a calculated measure"
+                },
+                "Revenue": {
+                    "type": "base_column",
+                    "wrap_in_aggregation": True,
+                    "reason": "Base data column"
+                }
+            }
+        """
+        import re
+
+        # Extract all [FieldName] references
+        pattern = r'\[([^\]]+)\]'
+        field_names = re.findall(pattern, formula)
+
+        result = {}
+        for field_name in field_names:
+            if field_name in dependency_metadata:
+                dep = dependency_metadata[field_name]
+
+                # Determine wrapping strategy
+                if dep.field_type == "BASE_COLUMN":
+                    result[field_name] = {
+                        "type": "base_column",
+                        "wrap_in_aggregation": True,
+                        "reason": "Physical column from data source"
+                    }
+                elif dep.field_type == "CALCULATED_MEASURE":
+                    result[field_name] = {
+                        "type": "calculated_measure",
+                        "wrap_in_aggregation": False,
+                        "reason": f"Already a measure (role={dep.original_role})"
+                    }
+                elif dep.field_type == "CALCULATED_COLUMN":
+                    result[field_name] = {
+                        "type": "calculated_column",
+                        "wrap_in_aggregation": True,
+                        "reason": "Row-level calculated field"
+                    }
+                else:
+                    result[field_name] = {
+                        "type": "unknown",
+                        "wrap_in_aggregation": True,
+                        "reason": "Unknown field type, defaulting to safe wrapping"
+                    }
+            else:
+                # Field not in metadata - conservative approach
+                result[field_name] = {
+                    "type": "unknown",
+                    "wrap_in_aggregation": True,
+                    "reason": "Field not found in metadata"
+                }
+
+        return result
+
+    def _build_field_reference_guide(
+        self,
+        referenced_fields: Dict[str, Dict[str, Any]]
+    ) -> str:
+        """
+        Build XML guide for LLM about how to handle each field
+
+        Example output:
+        <field name="Net Profit">
+          <type>calculated_measure</type>
+          <wrap_in_aggregation>false</wrap_in_aggregation>
+          <dax_usage>[Net Profit]</dax_usage>
+          <reason>Already a calculated measure</reason>
+        </field>
+        """
+        if not referenced_fields:
+            return "<field_references>\n  (No field references detected)\n</field_references>"
+
+        lines = ["<field_references>"]
+
+        for field_name, metadata in referenced_fields.items():
+            wrap = metadata["wrap_in_aggregation"]
+            field_type = metadata["type"]
+
+            if wrap:
+                dax_usage = f"SUM({{table}}[{field_name}])"
+            else:
+                dax_usage = f"[{field_name}]"
+
+            lines.append(f"""  <field name="{field_name}">
+    <type>{field_type}</type>
+    <wrap_in_aggregation>{str(wrap).lower()}</wrap_in_aggregation>
+    <dax_usage>{dax_usage}</dax_usage>
+    <reason>{metadata["reason"]}</reason>
+  </field>""")
+
+        lines.append("</field_references>")
+        return "\n".join(lines)
 
     # ============================================
     # Specialized Conversion Methods

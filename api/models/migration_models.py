@@ -161,6 +161,8 @@ class TableauCalculation:
     dependency_level: int = 0
     visual_context: Optional[Dict[str, Any]] = None
     used_in_worksheets: Optional[List[str]] = None
+    depends_on: Optional[List[str]] = None
+    depends_on_metadata: Optional[Dict[str, Dict[str, Any]]] = None
     created_at: Optional[datetime] = None
 
     @classmethod
@@ -172,6 +174,8 @@ class TableauCalculation:
         import json
         visual_context_str = row["visual_context"] if isinstance(row, dict) else row[5]
         used_in_str = row["used_in_worksheets"] if isinstance(row, dict) else row[6]
+        depends_on_str = row["depends_on"] if isinstance(row, dict) else row[8]
+        depends_on_metadata_str = row["depends_on_metadata"] if isinstance(row, dict) else row[9]
 
         return cls(
             calc_id=row["calc_id"] if isinstance(row, dict) else row[0],
@@ -182,7 +186,9 @@ class TableauCalculation:
             visual_context=json.loads(visual_context_str) if visual_context_str else None,
             dependency_level=row["dependency_level"] if isinstance(row, dict) else (row[7] or 0),
             used_in_worksheets=used_in_str.split(",") if used_in_str else None,
-            created_at=datetime.fromisoformat(row["created_at"]) if (row["created_at"] if isinstance(row, dict) else row[8]) and isinstance((row["created_at"] if isinstance(row, dict) else row[8]), str) else (row["created_at"] if isinstance(row, dict) else row[8]),
+            depends_on=json.loads(depends_on_str) if depends_on_str else None,
+            depends_on_metadata=json.loads(depends_on_metadata_str) if depends_on_metadata_str else None,
+            created_at=datetime.fromisoformat(row["created_at"]) if (row["created_at"] if isinstance(row, dict) else row[10]) and isinstance((row["created_at"] if isinstance(row, dict) else row[10]), str) else (row["created_at"] if isinstance(row, dict) else row[10]),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -196,6 +202,8 @@ class TableauCalculation:
             "visual_context": self.visual_context,
             "dependency_level": self.dependency_level,
             "used_in_worksheets": self.used_in_worksheets,
+            "depends_on": self.depends_on,
+            "depends_on_metadata": self.depends_on_metadata,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

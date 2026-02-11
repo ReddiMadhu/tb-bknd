@@ -34,6 +34,7 @@ class ValidationResult:
     pass_rate: float
     correction_attempts: int
     final_dax: str
+    needs_manual_review: bool = False  # Flag when validation was skipped or has issues
 
 
 class ValidationEngine:
@@ -114,18 +115,50 @@ class ValidationEngine:
         logger.info(f"  DAX: {dax_formula[:100]}...")
 
         # CRITICAL: Check if formula references other calculations
-        # Calculated fields like "Calculation_1753307659340042248" don't exist in Hyper
+        # Try to expand calculated field references before validation
         if self._references_calculated_fields(tableau_formula):
-            logger.warning(f"⚠️ Formula references other calculated fields - skipping validation")
-            logger.info(f"   Calculated fields don't exist in Hyper file (only raw columns)")
-            return ValidationResult(
-                conversion_id=conversion_id,
-                test_slices=[],
-                overall_passed=True,  # Assume pass (can't validate)
-                pass_rate=1.0,
-                final_dax=dax_formula,
-                correction_attempts=0
-            )
+            logger.info(f"🔄 Formula references calculated fields - attempting expansion...")
+
+            # Extract migration_id from conversion_id (format: mig_xxx_calc_yyy)
+            try:
+                migration_id = "_".join(conversion_id.split("_")[:2])  # Extract "mig_xxx"
+            except:
+                logger.warning("Could not extract migration_id from conversion_id")
+                migration_id = None
+
+            if migration_id:
+                # Try to expand calculated field references
+                expanded_formula = self._expand_calculated_field_references(
+                    tableau_formula,
+                    migration_id=migration_id,
+                    calc_name=conversion_id
+                )
+
+                if expanded_formula:
+                    logger.info(f"✅ Expanded formula: {expanded_formula[:100]}...")
+                    tableau_formula = expanded_formula  # Use expanded formula for validation
+                else:
+                    logger.warning(f"⚠️ Could not expand calculated fields - flagging for manual review")
+                    return ValidationResult(
+                        conversion_id=conversion_id,
+                        test_slices=[],
+                        overall_passed=False,  # Changed from True - this needs review!
+                        pass_rate=0.0,  # Changed from 1.0
+                        final_dax=dax_formula,
+                        correction_attempts=0,
+                        needs_manual_review=True  # Flag for manual review
+                    )
+            else:
+                logger.warning(f"⚠️ No migration_id found - flagging for manual review")
+                return ValidationResult(
+                    conversion_id=conversion_id,
+                    test_slices=[],
+                    overall_passed=False,  # Changed from True
+                    pass_rate=0.0,  # Changed from 1.0
+                    final_dax=dax_formula,
+                    correction_attempts=0,
+                    needs_manual_review=True  # Flag for manual review
+                )
 
         current_dax = dax_formula
         correction_attempts = 0
@@ -149,14 +182,15 @@ class ValidationEngine:
 
                 if not truth_map:
                     logger.warning("⚠️ No truth data extracted - likely missing columns (calculated fields)")
-                    # Return early with skip status
+                    # Return early with skip status - flag for manual review
                     return ValidationResult(
                         conversion_id=conversion_id,
                         test_slices=[],
-                        overall_passed=True,
-                        pass_rate=1.0,
+                        overall_passed=False,  # Changed from True - this is a failure!
+                        pass_rate=0.0,  # Changed from 1.0
                         final_dax=dax_formula,
-                        correction_attempts=0
+                        correction_attempts=0,
+                        needs_manual_review=True  # Flag for manual review
                     )
 
                 logger.info(f"✅ Extracted {len(truth_map)} truth slices")
@@ -871,6 +905,89 @@ Return ONLY valid JSON:
     # ============================================
     # Utility Methods
     # ============================================
+
+    def _expand_calculated_field_references(
+        self,
+        formula: str,
+        migration_id: str,
+        calc_name: str,
+        max_depth: int = 10
+    ) -> Optional[str]:
+        """
+        Recursively expand calculated field references to base columns only
+
+        Example:
+            Input:  "SUM([Net Profit]) / SUM([Revenue])"
+            Where:  [Net Profit] = "SUM([Revenue]) - SUM([Cost])"
+            Output: "SUM(SUM([Revenue]) - SUM([Cost])) / SUM([Revenue])"
+
+        Args:
+            formula: Tableau formula with calculated field references
+            migration_id: Migration ID to lookup calculations
+            calc_name: Current calculation name (for logging)
+            max_depth: Maximum recursion depth to prevent circular dependencies
+
+        Returns:
+            Expanded formula with only base column references, or None if circular dependency
+        """
+        from storage.migration_store import MigrationStore
+        import re
+
+        try:
+            # Get all calculations for this migration
+            store = MigrationStore()
+            calculations = store.get_calculations_by_migration(migration_id)
+
+            # Build lookup: {calc_name: {formula, metadata}}
+            calc_map = {}
+            for calc in calculations:
+                if calc.depends_on_metadata:
+                    calc_map[calc.calc_name] = {
+                        "formula": calc.calc_formula,
+                        "depends_on": calc.depends_on or [],
+                        "metadata": calc.depends_on_metadata
+                    }
+
+            # Recursive expansion with depth limit
+            expanded = formula
+            depth = 0
+
+            while depth < max_depth:
+                # Find all [FieldName] references
+                pattern = r'\[([^\]]+)\]'
+                matches = re.findall(pattern, expanded)
+
+                made_substitution = False
+                for match in matches:
+                    if match in calc_map:
+                        # Check if this is a calculated measure (already aggregated)
+                        metadata = calc_map[match]["metadata"]
+
+                        # Look for this field in the metadata
+                        field_info = metadata.get(match)
+                        if field_info and field_info.get("field_type") == "CALCULATED_MEASURE":
+                            # This is already a measure - substitute with its formula
+                            calc_formula = calc_map[match]["formula"]
+                            # Wrap in parentheses to preserve precedence
+                            expanded = expanded.replace(f"[{match}]", f"({calc_formula})")
+                            made_substitution = True
+                            logger.debug(f"  Expanded [{match}] → ({calc_formula[:50]}...)")
+
+                if not made_substitution:
+                    # No more calculated field references to expand
+                    break
+
+                depth += 1
+
+            if depth >= max_depth:
+                logger.warning(f"Max recursion depth reached for {calc_name} - possible circular dependency")
+                return None
+
+            return expanded
+
+        except Exception as e:
+            logger.error(f"Failed to expand calculated field references: {e}")
+            return None
 
     def _references_calculated_fields(self, formula: str) -> bool:
         """

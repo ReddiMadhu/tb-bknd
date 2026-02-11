@@ -303,12 +303,30 @@ class MigrationStore:
             else None
         )
 
+        # Serialize dependency metadata (NEW)
+        depends_on_json = (
+            json.dumps(calculation.depends_on) if calculation.depends_on else None
+        )
+
+        depends_on_metadata_json = None
+        if calculation.depends_on_metadata:
+            # Convert FieldDependency objects to serializable dicts
+            depends_on_metadata_dict = {
+                field_name: {
+                    "field_type": metadata.get("field_type"),
+                    "original_role": metadata.get("original_role"),
+                    "is_aggregated": metadata.get("is_aggregated"),
+                }
+                for field_name, metadata in calculation.depends_on_metadata.items()
+            }
+            depends_on_metadata_json = json.dumps(depends_on_metadata_dict)
+
         with get_db_connection() as conn:
             conn.execute(
                 """
                 INSERT INTO tableau_calculations
-                (calc_id, workbook_id, calc_name, calc_formula, calc_type, visual_context, dependency_level, used_in_worksheets, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (calc_id, workbook_id, calc_name, calc_formula, calc_type, visual_context, dependency_level, used_in_worksheets, depends_on, depends_on_metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     calculation.calc_id,
@@ -319,6 +337,8 @@ class MigrationStore:
                     visual_context_json,
                     calculation.dependency_level,
                     used_in_str,
+                    depends_on_json,
+                    depends_on_metadata_json,
                     datetime.utcnow(),
                 ),
             )
@@ -341,7 +361,7 @@ class MigrationStore:
             rows = conn.execute(
                 """
                 SELECT calc_id, workbook_id, calc_name, calc_formula, calc_type,
-                       visual_context, used_in_worksheets, dependency_level, created_at
+                       visual_context, used_in_worksheets, dependency_level, depends_on, depends_on_metadata, created_at
                 FROM tableau_calculations
                 WHERE workbook_id = ?
                 ORDER BY dependency_level, calc_name
@@ -367,7 +387,7 @@ class MigrationStore:
             rows = conn.execute(
                 """
                 SELECT c.calc_id, c.workbook_id, c.calc_name, c.calc_formula, c.calc_type,
-                       c.visual_context, c.used_in_worksheets, c.dependency_level, c.created_at
+                       c.visual_context, c.used_in_worksheets, c.dependency_level, c.depends_on, c.depends_on_metadata, c.created_at
                 FROM tableau_calculations c
                 JOIN tableau_workbooks w ON c.workbook_id = w.workbook_id
                 WHERE w.migration_id = ?

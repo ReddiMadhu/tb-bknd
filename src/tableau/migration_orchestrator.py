@@ -427,6 +427,18 @@ class MigrationOrchestrator:
                 else:
                     calc_type = CalculationType.CALCULATED_FIELD
 
+                # Serialize dependency metadata
+                depends_on_metadata_dict = None
+                if hasattr(calc_node, 'depends_on_metadata') and calc_node.depends_on_metadata:
+                    depends_on_metadata_dict = {
+                        field_name: {
+                            "field_type": dep.field_type,
+                            "original_role": dep.original_role,
+                            "is_aggregated": dep.is_aggregated,
+                        }
+                        for field_name, dep in calc_node.depends_on_metadata.items()
+                    }
+
                 # Create TableauCalculation object
                 tableau_calc = TableauCalculation(
                     calc_id=calc_id,
@@ -439,7 +451,9 @@ class MigrationOrchestrator:
                         "partition_by": calc_node.visual_context.partition_by
                     },
                     dependency_level=calc_node.dependency_level,
-                    used_in_worksheets=",".join(calc_node.visual_context.used_in_worksheets)
+                    used_in_worksheets=",".join(calc_node.visual_context.used_in_worksheets),
+                    depends_on=list(calc_node.depends_on) if hasattr(calc_node, 'depends_on') and calc_node.depends_on else None,
+                    depends_on_metadata=depends_on_metadata_dict
                 )
                 self.migration_store.save_calculation(tableau_calc)
 
@@ -717,14 +731,23 @@ class MigrationOrchestrator:
                         dax_formula=validation_result.final_dax
                     )
 
-                # Update conversion status
-                if validation_result.overall_passed:
+                # Update conversion status based on validation result
+                if validation_result.needs_manual_review:
+                    # Validation was skipped or had issues - needs human review
+                    self.migration_store.update_conversion(
+                        conversion_id=conversion["conversion_id"],
+                        status=ConversionStatus.MANUAL_REVIEW
+                    )
+                    logger.warning(f"⚠️ Flagged for manual review: {calc_name}")
+                elif validation_result.overall_passed:
+                    # Validation passed - mark as validated
                     self.migration_store.update_conversion(
                         conversion_id=conversion["conversion_id"],
                         status=ConversionStatus.VALIDATED
                     )
                     perfect_matches += 1
                 else:
+                    # Validation failed - keep as pending for retry
                     self.migration_store.update_conversion(
                         conversion_id=conversion["conversion_id"],
                         status=ConversionStatus.PENDING  # Keep as pending if not perfect

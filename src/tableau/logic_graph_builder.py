@@ -9,6 +9,16 @@ from loguru import logger
 from src.tableau.twb_parser import CalculatedField, LODExpression, Worksheet, VisualType
 
 
+@dataclass
+class FieldDependency:
+    """Metadata about a field dependency"""
+    field_name: str
+    field_type: str  # "BASE_COLUMN" | "CALCULATED_MEASURE" | "CALCULATED_COLUMN"
+    original_role: str  # "measure" | "dimension" from Tableau
+    is_aggregated: bool  # True if it's already an aggregate
+    source_calc: 'CalculationNode' = None
+
+
 class CalculationType(Enum):
     """Classification of calculation types"""
     MEASURE = "MEASURE"  # Aggregate calculation (SUM, AVG, etc.)
@@ -89,6 +99,13 @@ class CalculationNode:
     is_lod: bool = False
     lod_type: str = None  # FIXED, INCLUDE, EXCLUDE
     context_transition: ContextTransition = None  # NEW: Component 2
+    tableau_role: str = None  # "measure" or "dimension" from Tableau
+    depends_on_metadata: Dict[str, FieldDependency] = None  # NEW: Dependency metadata
+
+    def __post_init__(self):
+        """Initialize mutable default values"""
+        if self.depends_on_metadata is None:
+            self.depends_on_metadata = {}
 
 
 class LogicGraphBuilder:
@@ -109,6 +126,7 @@ class LogicGraphBuilder:
         self.calculations: Dict[str, CalculationNode] = {}
         self.base_fields: Set[str] = set()  # Non-calculated fields
         self.worksheets: List[Worksheet] = []
+        self.field_roles: Dict[str, str] = {}  # NEW: Track role metadata (measure/dimension)
 
     def build_graph(
         self,
@@ -134,6 +152,10 @@ class LogicGraphBuilder:
         self.base_fields = base_field_names
         self.worksheets = worksheets
 
+        # Build role map from calculated fields
+        for calc in calculated_fields:
+            self.field_roles[calc.name] = calc.role  # "measure" or "dimension"
+
         # Step 1: Create nodes for all calculations
         for calc in calculated_fields:
             self._add_calculation_node(calc)
@@ -146,10 +168,54 @@ class LogicGraphBuilder:
                 node.lod_type = lod.lod_type
                 node.calc_type = CalculationType.LOD_EXPRESSION
 
-        # Step 3: Extract dependencies and build edges
+        # Step 3: Extract dependencies and build edges with metadata
         for calc_name, node in self.calculations.items():
             dependencies = self._extract_dependencies(node.formula)
             node.depends_on = dependencies
+
+            # Build dependency metadata
+            depends_on_metadata = {}
+            for dep in dependencies:
+                if dep in self.base_fields:
+                    # Base column from data source
+                    depends_on_metadata[dep] = FieldDependency(
+                        field_name=dep,
+                        field_type="BASE_COLUMN",
+                        original_role="dimension",  # Base fields are typically dimensions
+                        is_aggregated=False,
+                        source_calc=None
+                    )
+                elif dep in self.calculations:
+                    # Reference to another calculation
+                    dep_calc = self.calculations[dep]
+
+                    # Determine if it's a measure or calculated column
+                    if dep_calc.calc_type == CalculationType.MEASURE:
+                        field_type = "CALCULATED_MEASURE"
+                        is_aggregated = True
+                    else:
+                        field_type = "CALCULATED_COLUMN"
+                        is_aggregated = False
+
+                    depends_on_metadata[dep] = FieldDependency(
+                        field_name=dep,
+                        field_type=field_type,
+                        original_role=self.field_roles.get(dep, "unknown"),
+                        is_aggregated=is_aggregated,
+                        source_calc=dep_calc
+                    )
+                else:
+                    # Unknown field - conservative fallback
+                    depends_on_metadata[dep] = FieldDependency(
+                        field_name=dep,
+                        field_type="UNKNOWN",
+                        original_role="unknown",
+                        is_aggregated=False,
+                        source_calc=None
+                    )
+
+            # Store metadata in node
+            node.depends_on_metadata = depends_on_metadata
 
             # Add edges: dependency -> calculation
             for dep in dependencies:
@@ -194,7 +260,8 @@ class LogicGraphBuilder:
                 partition_by=[],
                 sort_by=[],
                 filters=FilterContext([], [], False)
-            )
+            ),
+            tableau_role=calc.role  # NEW: Preserve Tableau role
         )
 
         self.calculations[calc.name] = node

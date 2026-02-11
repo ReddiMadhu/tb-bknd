@@ -114,6 +114,8 @@ CREATE TABLE IF NOT EXISTS tableau_calculations (
     calc_type TEXT CHECK(calc_type IN ('CALCULATED_FIELD', 'MEASURE', 'PARAMETER', 'LOD', 'TABLE_CALC')) NOT NULL,
     visual_context TEXT,  -- JSON string
     dependency_level INTEGER DEFAULT 0,
+    depends_on TEXT,  -- NEW: JSON array of dependency field names
+    depends_on_metadata TEXT,  -- NEW: JSON object with type metadata
     used_in_worksheets TEXT,  -- Comma-separated list
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
