@@ -582,14 +582,26 @@ class MigrationOrchestrator:
 
             logger.info(f"Generating DAX for: {calc_name}")
 
-            # Get data profile (use first available)
-            data_profile = next(iter(data_profiles.values()), {}).get("profile") if data_profiles else None
+            # Get data profile and table name (use first available)
+            first_profile_data = next(iter(data_profiles.values()), {}) if data_profiles else {}
+            data_profile = first_profile_data.get("profile")
+            
+            # Detect table name (default to None if not found)
+            actual_table_name = first_profile_data.get("primary_table")
+            
+            # If table name has schema (e.g. "Extract"."Table"), clean it
+            if actual_table_name and "." in actual_table_name:
+                actual_table_name = actual_table_name.split(".")[-1].strip('"')
+
+            # Filter out generic "Extract" table name
+            if actual_table_name and actual_table_name.lower() == "extract":
+                actual_table_name = None
 
             # Generate DAX
             dax_result = self.dax_generator.tableau_to_dax(
                 calc_node=calc_node,
                 data_profile=data_profile.__dict__ if data_profile else None,
-                table_name="Sales"  # TODO: Get actual table name from data source
+                table_name=actual_table_name or ""
             )
 
             # NEW: Check if table calculation requires model enhancement
@@ -602,7 +614,7 @@ class MigrationOrchestrator:
                     calc_name=calc_name,
                     partition_by=calc_node.visual_context.partition_by if calc_node.visual_context else [],
                     sort_by=calc_node.visual_context.sort_by if calc_node.visual_context else [],
-                    table_name="Sales"  # TODO: Get actual table name
+                    table_name=actual_table_name or ""
                 )
 
                 if model_enhancement:
@@ -879,6 +891,12 @@ class MigrationOrchestrator:
         try:
             relationships = self._build_data_model(migration_id, workbooks_data, progress_callback)
             logger.info(f"✅ Data model built: {len(relationships)} relationships")
+            
+            # Save relationship count to database
+            self.migration_store.update_migration_counts(
+                migration_id,
+                relationship_count=len(relationships)
+            )
         except Exception as e:
             logger.error(f"❌ Failed to build data model: {e}", exc_info=True)
             relationships = []
@@ -900,32 +918,32 @@ class MigrationOrchestrator:
             logger.error(f"❌ Failed to convert filters: {e}", exc_info=True)
             filter_param_results = {"filters": [], "whatif_parameters": [], "slicer_tables": []}
 
-        # Step 3: Generate PBIP project
-        self._update_progress(
-            migration_id,
-            MigrationStatus.VALIDATING,
-            84,
-            "Generating Power BI Project (PBIP)...",
-            progress_callback
-        )
+        # Step 3: Generate PBIP project - DISABLED as per request
+        # self._update_progress(
+        #     migration_id,
+        #     MigrationStatus.VALIDATING,
+        #     84,
+        #     "Generating Power BI Project (PBIP)...",
+        #     progress_callback
+        # )
 
-        logger.info("Step 3/5: Generating PBIP project structure...")
-        try:
-            pbip_path = self._generate_pbip_project(
-                migration_id,
-                conversions,
-                relationships,
-                filter_param_results,
-                workbooks_data,
-                progress_callback
-            )
-            if pbip_path:
-                logger.info(f"✅ PBIP project created: {pbip_path}")
-            else:
-                logger.warning("⚠️  PBIP generation failed")
-        except Exception as e:
-            logger.error(f"❌ Failed to generate PBIP: {e}", exc_info=True)
-            pbip_path = None
+        # logger.info("Step 3/5: Generating PBIP project structure...")
+        # try:
+        #     pbip_path = self._generate_pbip_project(
+        #         migration_id,
+        #         conversions,
+        #         relationships,
+        #         filter_param_results,
+        #         workbooks_data,
+        #         progress_callback
+        #     )
+        #     if pbip_path:
+        #         logger.info(f"✅ PBIP project created: {pbip_path}")
+        #     else:
+        #         logger.warning("⚠️  PBIP generation failed")
+        # except Exception as e:
+        #     logger.error(f"❌ Failed to generate PBIP: {e}", exc_info=True)
+        pbip_path = None
 
         # Step 4: Export table data to Excel
         self._update_progress(
@@ -948,26 +966,26 @@ class MigrationOrchestrator:
             logger.error(f"❌ Failed to export table data: {e}", exc_info=True)
             excel_files = []
 
-        # Step 5: Generate documentation (without suggestions)
-        self._update_progress(
-            migration_id,
-            MigrationStatus.VALIDATING,
-            90,
-            "Generating documentation...",
-            progress_callback
-        )
+        # Step 5: Generate documentation (without suggestions) - DISABLED as per request
+        # self._update_progress(
+        #     migration_id,
+        #     MigrationStatus.VALIDATING,
+        #     90,
+        #     "Generating documentation...",
+        #     progress_callback
+        # )
 
-        logger.info("Step 5/5: Generating documentation...")
-        try:
-            self._generate_migration_documentation(
-                migration_id,
-                workbooks_data,
-                filter_param_results,
-                Path("exports") / migration_id
-            )
-            logger.info("✅ Documentation generated")
-        except Exception as e:
-            logger.error(f"❌ Failed to generate documentation: {e}", exc_info=True)
+        # logger.info("Step 5/5: Generating documentation...")
+        # try:
+        #     self._generate_migration_documentation(
+        #         migration_id,
+        #         workbooks_data,
+        #         filter_param_results,
+        #         Path("exports") / migration_id
+        #     )
+        #     logger.info("✅ Documentation generated")
+        # except Exception as e:
+        #     logger.error(f"❌ Failed to generate documentation: {e}", exc_info=True)
 
         logger.info("=" * 60)
         logger.info("✅ PHASE 5 COMPLETE")
@@ -977,7 +995,7 @@ class MigrationOrchestrator:
             "validated_count": validated_count,
             "perfect_matches": perfect_matches,
             "avg_pass_rate": avg_pass_rate,
-            "pbip_path": str(pbip_path) if pbip_path else None,
+            # "pbip_path": str(pbip_path) if pbip_path else None,
             "excel_files": excel_files,
             "relationships_count": len(relationships)
         }

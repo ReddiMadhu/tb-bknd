@@ -637,6 +637,9 @@ async def export_powerbi_artifacts(migration_id: str):
     try:
         # Create ZIP file
         with zipfile.ZipFile(artifact_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Refresh migration object to get latest counts
+            migration = migration_store.get_migration(migration_id)
+            
             # 1. Add migration metadata
             zipf.writestr(
                 "migration_metadata.json", 
@@ -650,16 +653,92 @@ async def export_powerbi_artifacts(migration_id: str):
                 "dax_conversions.json", 
                 json.dumps(conversions_data, indent=2, default=str)
             )
-            
-            # 3. Add placeholder README
+
+            # 3. Add validation results (New)
+            validation_results = migration_store.get_validation_results_by_migration(migration_id)
+            # Convert to dict for JSON serialization
+            validation_data = {
+                k: [v.to_dict() for v in val_list] 
+                for k, val_list in validation_results.items()
+            }
             zipf.writestr(
-                "README.txt",
-                f"Power BI Export for Migration {migration_id}\n\n"
-                f"Generated at: {datetime.now().isoformat()}\n"
-                f"Status: {migration.status.value}\n\n"
-                "This export contains the JSON metadata and DAX conversions.\n"
-                "The full PBIP generation is currently in development."
+                "validation_results.json",
+                json.dumps(validation_data, indent=2, default=str)
             )
+
+            # 4. Add workbooks metadata (New)
+            workbooks = migration_store.get_workbooks_by_migration(migration_id)
+            workbooks_data = [wb.to_dict() for wb in workbooks]
+            zipf.writestr(
+                "workbooks.json",
+                json.dumps(workbooks_data, indent=2, default=str)
+            )
+
+            # 5. Add calculation metadata (New)
+            calculations = migration_store.get_calculations_by_migration(migration_id)
+            # Calculations might be large, but useful for full context
+            calculations_data = [calc.to_dict() for calc in calculations]
+            zipf.writestr(
+                "calculations.json",
+                json.dumps(calculations_data, indent=2, default=str)
+            )
+
+            # 6. Add TMSL/BIM model file (New)
+            # Build valid model.bim structure for Tabular Editor import
+            measures = []
+            for c in conversions:
+                if c.dax_formula:
+                   measures.append({
+                       "name": c.calc_id.split('_')[-1] if '_' in c.calc_id else c.calc_id, # Simplified naming
+                       "expression": c.dax_formula,
+                       "formatString": "#,##0.00"
+                   })
+
+            model_bim = {
+                "name": "SemanticModel",
+                "compatibilityLevel": 1500,
+                "model": {
+                    "culture": "en-US",
+                    "tables": [
+                        {
+                            "name": "_Calculations", 
+                            "columns": [
+                                { "name": "Column", "dataType": "string", "sourceColumn": "Column" }
+                            ],
+                            "partitions": [
+                                {
+                                    "name": "Partition",
+                                    "mode": "import",
+                                    "source": {
+                                        "type": "m",
+                                        "expression": "let\n Source = Table.FromRows(Json.Document(Binary.Decompress(Binary.FromText(\"i44FAA==\", BinaryEncoding.Base64), Compression.Deflate)), let _t = ((type nullable text) meta [Serialized.Text = true]) in type table [Column = _t])\nin\n Source"
+                                    }
+                                }
+                            ],
+                            "measures": measures
+                        }
+                    ]
+                }
+            }
+            zipf.writestr(
+                "model.bim",
+                json.dumps(model_bim, indent=2)
+            )
+            
+            # 6. Add updated README - REMOVED as per request
+            # zipf.writestr(
+            #     "README.txt",
+            #     f"Power BI Export for Migration {migration_id}\n\n"
+            #     f"Generated at: {datetime.now().isoformat()}\n"
+            #     f"Status: {migration.status.value}\n\n"
+            #     "This export contains comprehensive metadata for the migration:\n"
+            #     "- migration_metadata.json: Job status and high-level counts.\n"
+            #     "- dax_conversions.json: Detailed DAX formulas and conversion status.\n"
+            #     "- validation_results.json: 100% fidelity validation results for each conversion.\n"
+            #     "- workbooks.json: Details of processed Tableau workbooks.\n"
+            #     "- calculations.json: Full dependency graph and metadata of Tableau calculations.\n\n"
+            #     "Note: PBIP generation was skipped for this migration."
+            # )
             
         logger.info(f"Generated artifacts ZIP for {migration_id} at {artifact_path}")
         
@@ -671,9 +750,11 @@ async def export_powerbi_artifacts(migration_id: str):
         "message": "Power BI artifacts generated",
         "download_url": f"/api/v1/migration/{migration_id}/download",
         "artifacts": {
-            "dax_measures": "dax_conversions.json",
             "metadata": "migration_metadata.json",
-            "readme": "README.txt"
+            "conversions": "dax_conversions.json",
+            "validations": "validation_results.json",
+            "workbooks": "workbooks.json",
+            "calculations": "calculations.json"
         }
     }
 
