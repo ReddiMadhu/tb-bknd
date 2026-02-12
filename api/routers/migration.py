@@ -1503,12 +1503,10 @@ async def download_conversion_report(
     Download Excel conversion report for Page 4 - DAX Conversion
 
     Generates an Excel file with:
-    - Calculation name
-    - Tableau formula
-    - DAX formula
-    - Confidence score
-    - Status (Auto-converted, Manual review, Failed)
-    - Warnings
+    - Calculated Field (Friendly Name)
+    - Tableau Formula (Cleaned)
+    - DAX Formula (Cleaned)
+    - Validation Test (Passed/Manual Review)
 
     Query params:
         conversion_ids: Optional comma-separated list of conversion IDs to export
@@ -1519,6 +1517,8 @@ async def download_conversion_report(
     try:
         import pandas as pd
         from io import BytesIO
+        import re
+        from src.tableau.twb_parser import TableauTWBParser
 
         # Get conversions
         conversions = migration_store.get_conversions_by_migration(migration_id)
@@ -1532,30 +1532,83 @@ async def download_conversion_report(
         # Create mapping of calc_id to calculation
         calc_map = {c.calc_id: c for c in calculations}
 
-        # Build report data
+        # ---------------------------------------------------------
+        # 1. Build Replacement Map (Internal Name -> Caption)
+        # ---------------------------------------------------------
+        replacement_map = {}
+        try:
+            workbooks = migration_store.get_workbooks_by_migration(migration_id)
+            for workbook in workbooks:
+                if workbook.file_path:
+                    try:
+                        parser = TableauTWBParser(workbook.file_path)
+                        # We only need calculated fields to get captions
+                        raw_calcs = parser.parse_calculated_fields()
+                        for cf in raw_calcs:
+                            display_name = cf.caption if cf.caption else cf.name
+                            if cf.name:
+                                replacement_map[cf.name] = display_name
+                    except Exception as e:
+                        logger.warning(f"Failed to parse workbook {workbook.filename} for captions: {e}")
+        except Exception as e:
+            logger.error(f"Failed to build replacement map: {e}")
+
+        # Helper to clean formulas
+        # Sort keys by length descending to replace longest naming conflicts first
+        sorted_keys = sorted(replacement_map.keys(), key=len, reverse=True)
+
+        def replace_names(formula):
+            if not formula:
+                return ""
+            updated = formula
+            for internal in sorted_keys:
+                readable = replacement_map[internal]
+                # Escape special chars in internal name
+                escaped_internal = re.escape(internal)
+                
+                # 1. Replace bracketed references: [Internal] -> [Readable]
+                updated = re.sub(f"\\[{escaped_internal}\\]", f"[{readable}]", updated)
+
+                # 2. Replace unbracketed occurrences (e.g. definition on LHS): Internal = ...
+                # Use word boundaries to avoid partial matches
+                updated = re.sub(f"\\b{escaped_internal}\\b", readable, updated)
+            return updated
+
+        # ---------------------------------------------------------
+        # 2. Build Report Data
+        # ---------------------------------------------------------
         report_data = []
 
         for conv in conversions:
             calc = calc_map.get(conv.calc_id)
 
             if calc:
-                # Determine status category
-                if conv.confidence_score >= 0.9:
-                    status = "AUTO_CONVERTED"
-                elif conv.confidence_score >= 0.7:
-                    status = "MANUAL_REVIEW"
+                # Determine Validation Test status
+                # If confidence > 95%, mark as Passed
+                # Otherwise keep existing validation status or default to Manual Review
+                if (conv.confidence_score or 0) > 0.95:
+                    validation_status = "Passed"
                 else:
-                    status = "FAILED"
+                    # Map internal status to readable string
+                    if conv.status.value == "validated":
+                        validation_status = "Passed"
+                    elif conv.status.value == "failed":
+                        validation_status = "Failed"
+                    else:
+                        validation_status = "Manual Review"
+
+                # Use friendly name if available, otherwise fallback to calc_name
+                friendly_name = replacement_map.get(calc.calc_name, calc.calc_name)
+                
+                # Clean formulas
+                cleaned_tableau_formula = replace_names(calc.calc_formula)
+                cleaned_dax_formula = replace_names(conv.dax_formula)
 
                 report_data.append({
-                    "Calculation Name": calc.calc_name,
-                    "Tableau Formula": calc.calc_formula,
-                    "DAX Formula": conv.dax_formula,
-                    "Confidence Score": f"{conv.confidence_score * 100:.1f}%",
-                    "Status": status,
-                    "Conversion Method": conv.conversion_method.value if hasattr(conv, 'conversion_method') else "LLM",
-                    "Warnings": "; ".join(conv.warnings) if conv.warnings else "None",
-                    "Reasoning": conv.reasoning if hasattr(conv, 'reasoning') else ""
+                    "Calculated Field": friendly_name,
+                    "Tableau Formula": cleaned_tableau_formula,
+                    "DAX Formula": cleaned_dax_formula,
+                    "Validation Test": validation_status
                 })
 
         # Create Excel file

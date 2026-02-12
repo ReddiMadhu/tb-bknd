@@ -772,7 +772,9 @@ class TableauTWBParser:
             if dimensions and measures:
                 return "Table"
 
-            return "Automatic"
+            return "Card" # Default to Card if still Automatic/Unknown with no structure
+        elif ct_str in ["Unknown", "unknown"]:
+            return "Card"
         else:
             return chart_type
 
@@ -811,6 +813,13 @@ class TableauTWBParser:
             if measures:
                 rows = f"SUM({measures[0]})"
                 
+        elif ct_lower == "card":
+             # Strategy for cards: show dimension (if any) and measure
+             if dimensions:
+                 columns = dimensions[0]
+             if measures:
+                 rows = f"SUM({measures[0]})"
+
         return {
             "columns": columns,
             "rows": rows,
