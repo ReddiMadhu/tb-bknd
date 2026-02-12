@@ -640,106 +640,251 @@ async def export_powerbi_artifacts(migration_id: str):
             # Refresh migration object to get latest counts
             migration = migration_store.get_migration(migration_id)
             
-            # 1. Add migration metadata
-            zipf.writestr(
-                "migration_metadata.json", 
-                json.dumps(migration.to_dict(), indent=2, default=str)
-            )
-            
-            # 2. Add conversions
+            # ---------------------------------------------------------
+            # Generate Excel Report (Combined DAX, Worksheet Analysis, & Data Tables)
+            # ---------------------------------------------------------
+            import pandas as pd
+            from io import BytesIO
+            import re
+            from src.tableau.twb_parser import TableauTWBParser
+            from src.tableau.hyper_profiler import HyperDataProfiler
+
+            # --- 1. PREPARE DATA ---
+            # Get conversions & calculations
             conversions = migration_store.get_conversions_by_migration(migration_id)
-            conversions_data = [c.to_dict() for c in conversions]
-            zipf.writestr(
-                "dax_conversions.json", 
-                json.dumps(conversions_data, indent=2, default=str)
-            )
-
-            # 3. Add validation results (New)
-            validation_results = migration_store.get_validation_results_by_migration(migration_id)
-            # Convert to dict for JSON serialization
-            validation_data = {
-                k: [v.to_dict() for v in val_list] 
-                for k, val_list in validation_results.items()
-            }
-            zipf.writestr(
-                "validation_results.json",
-                json.dumps(validation_data, indent=2, default=str)
-            )
-
-            # 4. Add workbooks metadata (New)
-            workbooks = migration_store.get_workbooks_by_migration(migration_id)
-            workbooks_data = [wb.to_dict() for wb in workbooks]
-            zipf.writestr(
-                "workbooks.json",
-                json.dumps(workbooks_data, indent=2, default=str)
-            )
-
-            # 5. Add calculation metadata (New)
             calculations = migration_store.get_calculations_by_migration(migration_id)
-            # Calculations might be large, but useful for full context
-            calculations_data = [calc.to_dict() for calc in calculations]
-            zipf.writestr(
-                "calculations.json",
-                json.dumps(calculations_data, indent=2, default=str)
-            )
+            calc_map = {c.calc_id: c for c in calculations}
+            
+            # Build Replacement Map (Internal Name -> Caption)
+            replacement_map = {}
+            workbooks_list = [] # Store for worksheet analysis
+            tables_report_data = [] # Store for data tables analysis
+            
+            try:
+                workbooks = migration_store.get_workbooks_by_migration(migration_id)
+                for workbook in workbooks:
+                    if workbook.file_path:
+                        try:
+                            parser = TableauTWBParser(workbook.file_path)
+                            
+                            # Parse Calculated Fields for Captions
+                            raw_calcs = parser.parse_calculated_fields()
+                            for cf in raw_calcs:
+                                display_name = cf.caption if cf.caption else cf.name
+                                if cf.name:
+                                    replacement_map[cf.name] = display_name
+                                    
+                            # Parse Worksheets for Analysis
+                            ws_data = parser.parse_worksheets()
+                            workbooks_list.append({
+                                "filename": workbook.filename,
+                                "worksheets": ws_data
+                            })
 
-            # 6. Add TMSL/BIM model file (New)
-            # Build valid model.bim structure for Tabular Editor import
-            measures = []
-            for c in conversions:
-                if c.dax_formula:
-                   measures.append({
-                       "name": c.calc_id.split('_')[-1] if '_' in c.calc_id else c.calc_id, # Simplified naming
-                       "expression": c.dax_formula,
-                       "formatString": "#,##0.00"
-                   })
+                            # Profile Data Tables (Hyper Files)
+                            if parser.hyper_files:
+                                try:
+                                    hyper_path = str(parser.hyper_files[0])
+                                    profiler = HyperDataProfiler(hyper_path)
+                                    tables = profiler.list_tables()
+                                    
+                                    for table in tables:
+                                        try:
+                                            # Strip quotes for profiling
+                                            table_unquoted = table.strip('"').replace('"."', '.')
+                                            # Light profiling
+                                            table_profile = profiler.profile_table(table_unquoted, sample_size=100)
+                                            
+                                            # Format columns as: Name (TYPE)
+                                            col_details = [f"{col.column_name} ({col.data_type})" for col in table_profile.columns]
+                                            
+                                            tables_report_data.append({
+                                                "Workbook": workbook.filename,
+                                                "Table Name": table,
+                                                "Row Count": table_profile.row_count,
+                                                "Column Count": len(col_details),
+                                                "Column Names": ", ".join(col_details)
+                                            })
+                                        except Exception as e:
+                                            logger.warning(f"Failed to profile table {table}: {e}")
+                                            
+                                except Exception as e:
+                                    logger.warning(f"Failed to profile hyper file for {workbook.filename}: {e}")
 
-            model_bim = {
-                "name": "SemanticModel",
-                "compatibilityLevel": 1500,
-                "model": {
-                    "culture": "en-US",
-                    "tables": [
-                        {
-                            "name": "_Calculations", 
-                            "columns": [
-                                { "name": "Column", "dataType": "string", "sourceColumn": "Column" }
-                            ],
-                            "partitions": [
-                                {
-                                    "name": "Partition",
-                                    "mode": "import",
-                                    "source": {
-                                        "type": "m",
-                                        "expression": "let\n Source = Table.FromRows(Json.Document(Binary.Decompress(Binary.FromText(\"i44FAA==\", BinaryEncoding.Base64), Compression.Deflate)), let _t = ((type nullable text) meta [Serialized.Text = true]) in type table [Column = _t])\nin\n Source"
+                        except Exception as e:
+                            logger.warning(f"Failed to parse workbook {workbook.filename}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to build replacment map: {e}")
+
+            # Helper to get friendly name
+            def get_friendly_name(name):
+                return replacement_map.get(name, name)
+
+            # Helper to clean formulas
+            sorted_keys = sorted(replacement_map.keys(), key=len, reverse=True)
+            def replace_names(formula):
+                if not formula: return ""
+                updated = formula
+                for internal in sorted_keys:
+                    readable = replacement_map[internal]
+                    escaped_internal = re.escape(internal)
+                    updated = re.sub(f"\\[{escaped_internal}\\]", f"[{readable}]", updated)
+                    updated = re.sub(f"\\b{escaped_internal}\\b", readable, updated)
+                return updated
+
+            # --- 2. BUILD DAX CONVERSION SHEET DATA ---
+            dax_report_data = []
+            for conv in conversions:
+                calc = calc_map.get(conv.calc_id)
+                if calc:
+                    # Determine Validation Status
+                    if (conv.confidence_score or 0) > 0.95:
+                        validation_status = "Passed"
+                    else:
+                        if conv.status.value == "validated": validation_status = "Passed"
+                        elif conv.status.value == "failed": validation_status = "Failed"
+                        else: validation_status = "Manual Review"
+
+                    friendly_name = get_friendly_name(calc.calc_name)
+                    
+                    dax_report_data.append({
+                        "Calculated Field": friendly_name,
+                        "Tableau Formula": replace_names(calc.calc_formula),
+                        "DAX Formula": replace_names(conv.dax_formula),
+                        "Validation Test": validation_status
+                    })
+
+            # --- 3. BUILD WORKSHEET ANALYSIS SHEET DATA ---
+            worksheet_report_data = []
+            for wb_data in workbooks_list:
+                filename = wb_data['filename']
+                for ws in wb_data['worksheets']:
+                    # Resolve Friendly Names for Lists
+                    dimensions = [get_friendly_name(d) for d in (ws.dimensions or [])]
+                    measures = [get_friendly_name(m.name if hasattr(m, 'name') else m) for m in (ws.measures or [])]
+                    base_measures = [get_friendly_name(m.name) for m in (ws.measures or []) if hasattr(m, 'type') and m.type == 'base_measure']
+                    
+                    # Resolve Axes
+                    # axes is a dictionary, not an object
+                    rows = ws.axes.get('rows') if ws.axes else None
+                    cols = ws.axes.get('columns') if ws.axes else None
+                    
+                    # Fallback logic for Cards (similar to frontend)
+                    if not rows and ws.visual_type.value == 'text' and ws.measures: 
+                         # Roughly mapping text tables/cards
+                         rows = get_friendly_name(ws.measures[0].name if hasattr(ws.measures[0], 'name') else ws.measures[0])
+                    else:
+                        rows = get_friendly_name(rows) if rows else '-'
+
+                    if not cols and ws.visual_type.value == 'text' and ws.dimensions:
+                        cols = get_friendly_name(ws.dimensions[0])
+                    else:
+                        cols = get_friendly_name(cols) if cols else '-'
+
+                    worksheet_report_data.append({
+                        "Workbook": filename,
+                        "Worksheet Name": ws.name,
+                        "Chart Type": ws.visual_type.value if ws.visual_type else "Automatic",
+                        "Dimensions": ", ".join(dimensions),
+                        "Measures": ", ".join(measures),
+                        "Base Measures": ", ".join(base_measures),
+                        "Rows": rows,
+                        "Columns": cols
+                    })
+
+            # --- 4. WRITE EXCEL FILE TO ZIP ---
+            excel_buffer = BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                # Sheet 1: DAX Conversions
+                df_dax = pd.DataFrame(dax_report_data)
+                df_dax.to_excel(writer, sheet_name='DAX Conversions', index=False)
+                
+                # Sheet 2: Worksheet Analysis
+                df_ws = pd.DataFrame(worksheet_report_data)
+                df_ws.to_excel(writer, sheet_name='Worksheet Analysis', index=False)
+
+                # Sheet 3: Data Tables
+                df_tables = pd.DataFrame(tables_report_data)
+                df_tables.to_excel(writer, sheet_name='Data Tables', index=False)
+
+                # Auto-adjust column widths for all sheets
+                for sheetname in writer.sheets:
+                    worksheet = writer.sheets[sheetname]
+                    for column in worksheet.columns:
+                        max_length = 0
+                        column_letter = column[0].column_letter
+                        for cell in column:
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(str(cell.value))
+                            except: pass
+                        adjusted_width = min(max_length + 2, 80)
+                        worksheet.column_dimensions[column_letter].width = adjusted_width
+
+            excel_buffer.seek(0)
+            zipf.writestr(f"migration_report_{migration_id}.xlsx", excel_buffer.getvalue())
+
+            # 5. Add minimal update info (Optional, to keep zip valid if empty)
+            zipf.writestr("README.txt", f"Migration Report for {migration_id}\nGenerated: {datetime.now().isoformat()}")
+
+            # ---------------------------------------------------------
+            # Generate model.bim (Semantic Model)
+            # ---------------------------------------------------------
+            try:
+                # Build valid model.bim structure for Tabular Editor import
+                bim_measures = []
+                for c in conversions:
+                    if c.dax_formula:
+                        bim_measures.append({
+                            "name": get_friendly_name(calc_map.get(c.calc_id).calc_name) if calc_map.get(c.calc_id) else c.calc_id,
+                            "expression": c.dax_formula,
+                            "formatString": "#,##0.00"
+                        })
+
+                model_bim = {
+                    "name": "SemanticModel",
+                    "compatibilityLevel": 1500,
+                    "model": {
+                        "culture": "en-US",
+                        "tables": [
+                            {
+                                "name": "_Calculations", 
+                                "columns": [
+                                    { "name": "Column", "dataType": "string", "sourceColumn": "Column" }
+                                ],
+                                "partitions": [
+                                    {
+                                        "name": "Partition",
+                                        "mode": "import",
+                                        "source": {
+                                            "type": "m",
+                                            "expression": "let\n Source = Table.FromRows(Json.Document(Binary.Decompress(Binary.FromText(\"i44FAA==\", BinaryEncoding.Base64), Compression.Deflate)), let _t = ((type nullable text) meta [Serialized.Text = true]) in type table [Column = _t])\nin\n Source"
+                                        }
                                     }
-                                }
-                            ],
-                            "measures": measures
-                        }
-                    ]
+                                ],
+                                "measures": bim_measures
+                            }
+                        ]
+                    }
                 }
-            }
-            zipf.writestr(
-                "model.bim",
-                json.dumps(model_bim, indent=2)
-            )
-            
-            # 6. Add updated README - REMOVED as per request
-            # zipf.writestr(
-            #     "README.txt",
-            #     f"Power BI Export for Migration {migration_id}\n\n"
-            #     f"Generated at: {datetime.now().isoformat()}\n"
-            #     f"Status: {migration.status.value}\n\n"
-            #     "This export contains comprehensive metadata for the migration:\n"
-            #     "- migration_metadata.json: Job status and high-level counts.\n"
-            #     "- dax_conversions.json: Detailed DAX formulas and conversion status.\n"
-            #     "- validation_results.json: 100% fidelity validation results for each conversion.\n"
-            #     "- workbooks.json: Details of processed Tableau workbooks.\n"
-            #     "- calculations.json: Full dependency graph and metadata of Tableau calculations.\n\n"
-            #     "Note: PBIP generation was skipped for this migration."
-            # )
-            
+                zipf.writestr(
+                    "model.bim",
+                    json.dumps(model_bim, indent=2)
+                )
+            except Exception as e:
+                logger.error(f"Failed to generate model.bim: {e}")
+                # We do not raise here to ensure at least Excel report is delivered
+                zipf.writestr("model_bim_error.txt", f"Failed to generate model.bim: {str(e)}")
+
+            # ---------------------------------------------------------
+            # Include Table Data Folder (Excel files)
+            # ---------------------------------------------------------
+            export_dir = Path("exports") / migration_id
+            table_data_dir = export_dir / "table_data"
+            if table_data_dir.exists():
+                for excel_file in table_data_dir.glob("*.xlsx"):
+                    zipf.write(excel_file, f"table_data/{excel_file.name}")
+
         logger.info(f"Generated artifacts ZIP for {migration_id} at {artifact_path}")
         
     except Exception as e:
@@ -1869,207 +2014,263 @@ async def get_recommendations(migration_id: str):
 async def download_all_artifacts(migration_id: str):
     """
     Download complete migration package
-
+    
     Includes:
-    - PBIX file (if generated)
-    - DAX measures file (.dax)
-    - Excel conversion report
-    - Table data (Excel files)
-    - Filter/parameter conversion report
-    - Visual conversion report
-    - Migration metadata (JSON)
-
-    Returns:
-        ZIP file download
+    - Excel Report (DAX Conversions, Worksheet Analysis, Data Tables)
+    - Semantic Model (model.bim)
+    - README.txt
     """
     try:
         import io
         import pandas as pd
+        import re
+        from io import BytesIO
+        from src.tableau.twb_parser import TableauTWBParser
+        from src.tableau.hyper_profiler import HyperDataProfiler
 
         # Create ZIP in memory
         zip_buffer = io.BytesIO()
 
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            # 1. Migration metadata
+            # Refresh migration object
             migration = migration_store.get_migration(migration_id)
-            zip_file.writestr(
-                "migration_metadata.json",
-                json.dumps(migration.to_dict(), indent=2, default=str)
-            )
-
-            export_dir = Path("exports") / migration_id
-
-            # Log export directory status
-            logger.info(f"📁 Export directory: {export_dir.absolute()}")
-            logger.info(f"📁 Directory exists: {export_dir.exists()}")
-
-            if export_dir.exists():
-                files_in_dir = list(export_dir.rglob("*"))
-                logger.info(f"📂 Files in export directory: {len(files_in_dir)}")
-                for f in files_in_dir[:10]:  # Log first 10 files
-                    logger.info(f"   - {f.relative_to(export_dir)}")
-            else:
-                logger.warning(f"⚠️  Export directory does not exist: {export_dir}")
-
-            # 2. PBIP folder (replaces PBIX - text-based Power BI Project)
-            pbip_folder = None
-            for item in export_dir.iterdir():
-                if item.is_dir() and item.name.endswith('.pbip'):
-                    pbip_folder = item
-                    break
-
-            logger.info(f"🔍 Checking for PBIP folder...")
-            if pbip_folder and pbip_folder.exists():
-                logger.info(f"📦 Adding PBIP project folder: {pbip_folder.name}")
-
-                # Add entire PBIP folder structure to ZIP
-                for pbip_file in pbip_folder.rglob('*'):
-                    if pbip_file.is_file():
-                        # Preserve folder structure in ZIP
-                        arcname = pbip_file.relative_to(export_dir)
-                        zip_file.write(pbip_file, str(arcname))
-
-                logger.info(f"✅ Added PBIP project with {len(list(pbip_folder.rglob('*')))} total items")
-            else:
-                logger.warning("⚠️  PBIP folder not found (expected format: {migration_id}.pbip)")
-
-            # NOTE: PBIX generation has been removed - PBIP is now the only format
-
-            # 3. DAX measures file
-            dax_path = export_dir / "measures.dax"
-            logger.info(f"🔍 Checking for DAX file: {dax_path}")
-            if dax_path.exists():
-                with open(dax_path, 'r', encoding='utf-8') as f:
-                    zip_file.writestr("dax_measures.dax", f.read())
-                logger.info("✅ Added DAX measures from file")
-            else:
-                logger.info("⚠️  DAX file not found, generating from database")
-                # Fallback: generate from conversions
-                conversions = migration_store.get_conversions_by_migration(migration_id)
-                calculations = migration_store.get_calculations_by_migration(migration_id)
-                calc_map = {c.calc_id: c for c in calculations}
-
-                dax_content = "-- DAX Measures Export\n"
-                dax_content += f"-- Generated: {datetime.now().isoformat()}\n"
-                dax_content += f"-- Migration ID: {migration_id}\n\n"
-
-                for conv in conversions:
-                    calc = calc_map.get(conv.calc_id)
-                    if calc:
-                        dax_content += f"-- Measure: {calc.calc_name}\n"
-                        dax_content += f"-- Original Tableau: {calc.calc_formula}\n"
-                        dax_content += f"-- Confidence: {conv.confidence_score * 100:.0f}%\n"
-                        dax_content += f"{conv.dax_formula}\n\n"
-
-                zip_file.writestr("dax_measures.dax", dax_content)
-
-            # 4. Excel conversion report
+            
+            # ---------------------------------------------------------
+            # Generate Excel Report (Combined DAX, Worksheet Analysis, & Data Tables)
+            # ---------------------------------------------------------
+            
+            # --- 1. PREPARE DATA ---
+            # Get conversions & calculations
             conversions = migration_store.get_conversions_by_migration(migration_id)
             calculations = migration_store.get_calculations_by_migration(migration_id)
             calc_map = {c.calc_id: c for c in calculations}
+            
+            # Build Replacement Map (Internal Name -> Caption)
+            replacement_map = {}
+            workbooks_list = [] # Store for worksheet analysis
+            tables_report_data = [] # Store for data tables analysis
+            
+            try:
+                workbooks = migration_store.get_workbooks_by_migration(migration_id)
+                for workbook in workbooks:
+                    if workbook.file_path:
+                        try:
+                            parser = TableauTWBParser(workbook.file_path)
+                            
+                            # Parse Calculated Fields for Captions
+                            raw_calcs = parser.parse_calculated_fields()
+                            for cf in raw_calcs:
+                                display_name = cf.caption if cf.caption else cf.name
+                                if cf.name:
+                                    replacement_map[cf.name] = display_name
+                                    
+                            # Parse Worksheets for Analysis
+                            ws_data = parser.parse_worksheets()
+                            workbooks_list.append({
+                                "filename": workbook.filename,
+                                "worksheets": ws_data
+                            })
 
-            report_data = []
+                            # Profile Data Tables (Hyper Files)
+                            if parser.hyper_files:
+                                try:
+                                    hyper_path = str(parser.hyper_files[0])
+                                    profiler = HyperDataProfiler(hyper_path)
+                                    tables = profiler.list_tables()
+                                    
+                                    for table in tables:
+                                        try:
+                                            # Strip quotes for profiling
+                                            table_unquoted = table.strip('"').replace('"."', '.')
+                                            # Light profiling
+                                            table_profile = profiler.profile_table(table_unquoted, sample_size=100)
+                                            
+                                            # Format columns as: Name (TYPE)
+                                            col_details = [f"{col.column_name} ({col.data_type})" for col in table_profile.columns]
+                                            
+                                            tables_report_data.append({
+                                                "Workbook": workbook.filename,
+                                                "Table Name": table,
+                                                "Row Count": table_profile.row_count,
+                                                "Column Count": len(col_details),
+                                                "Column Names": ", ".join(col_details)
+                                            })
+                                        except Exception as e:
+                                            logger.warning(f"Failed to profile table {table}: {e}")
+                                            
+                                except Exception as e:
+                                    logger.warning(f"Failed to profile hyper file for {workbook.filename}: {e}")
+
+                        except Exception as e:
+                            logger.warning(f"Failed to parse workbook {workbook.filename}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to build replacment map: {e}")
+
+            # Helper to get friendly name
+            def get_friendly_name(name):
+                return replacement_map.get(name, name)
+
+            # Helper to clean formulas
+            sorted_keys = sorted(replacement_map.keys(), key=len, reverse=True)
+            def replace_names(formula):
+                if not formula: return ""
+                updated = formula
+                for internal in sorted_keys:
+                    readable = replacement_map[internal]
+                    escaped_internal = re.escape(internal)
+                    updated = re.sub(f"\\[{escaped_internal}\\]", f"[{readable}]", updated)
+                    updated = re.sub(f"\\b{escaped_internal}\\b", readable, updated)
+                return updated
+
+            # --- 2. BUILD DAX CONVERSION SHEET DATA ---
+            dax_report_data = []
             for conv in conversions:
                 calc = calc_map.get(conv.calc_id)
                 if calc:
-                    status = "AUTO_CONVERTED" if conv.confidence_score >= 0.9 else \
-                            "MANUAL_REVIEW" if conv.confidence_score >= 0.7 else "FAILED"
+                    # Determine Validation Status
+                    if (conv.confidence_score or 0) > 0.95:
+                        validation_status = "Passed"
+                    else:
+                        if conv.status.value == "validated": validation_status = "Passed"
+                        elif conv.status.value == "failed": validation_status = "Failed"
+                        else: validation_status = "Manual Review"
 
-                    report_data.append({
-                        "Calculation Name": calc.calc_name,
-                        "Tableau Formula": calc.calc_formula,
-                        "DAX Formula": conv.dax_formula,
-                        "Confidence Score": f"{conv.confidence_score * 100:.1f}%",
-                        "Status": status
+                    friendly_name = get_friendly_name(calc.calc_name)
+                    
+                    dax_report_data.append({
+                        "Calculated Field": friendly_name,
+                        "Tableau Formula": replace_names(calc.calc_formula),
+                        "DAX Formula": replace_names(conv.dax_formula),
+                        "Validation Test": validation_status
                     })
 
-            df = pd.DataFrame(report_data)
-            excel_buffer = io.BytesIO()
+            # --- 3. BUILD WORKSHEET ANALYSIS SHEET DATA ---
+            worksheet_report_data = []
+            for wb_data in workbooks_list:
+                filename = wb_data['filename']
+                for ws in wb_data['worksheets']:
+                    # Resolve Friendly Names for Lists
+                    dimensions = [get_friendly_name(d) for d in (ws.dimensions or [])]
+                    measures = [get_friendly_name(m.name if hasattr(m, 'name') else m) for m in (ws.measures or [])]
+                    base_measures = [get_friendly_name(m.name) for m in (ws.measures or []) if hasattr(m, 'type') and m.type == 'base_measure']
+                    
+                    # Resolve Axes
+                    # axes is a dictionary, not an object
+                    rows = ws.axes.get('rows') if ws.axes else None
+                    cols = ws.axes.get('columns') if ws.axes else None
+                    
+                    # Fallback logic for Cards (similar to frontend)
+                    if not rows and ws.visual_type.value == 'text' and ws.measures: 
+                         # Roughly mapping text tables/cards
+                         rows = get_friendly_name(ws.measures[0].name if hasattr(ws.measures[0], 'name') else ws.measures[0])
+                    else:
+                        rows = get_friendly_name(rows) if rows else '-'
+
+                    if not cols and ws.visual_type.value == 'text' and ws.dimensions:
+                        cols = get_friendly_name(ws.dimensions[0])
+                    else:
+                        cols = get_friendly_name(cols) if cols else '-'
+
+                    worksheet_report_data.append({
+                        "Workbook": filename,
+                        "Worksheet Name": ws.name,
+                        "Chart Type": ws.visual_type.value if ws.visual_type else "Automatic",
+                        "Dimensions": ", ".join(dimensions),
+                        "Measures": ", ".join(measures),
+                        "Base Measures": ", ".join(base_measures),
+                        "Rows": rows,
+                        "Columns": cols
+                    })
+
+            # --- 4. WRITE EXCEL FILE TO ZIP ---
+            excel_buffer = BytesIO()
             with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                df.to_excel(writer, sheet_name='DAX Conversions', index=False)
+                # Sheet 1: DAX Conversions
+                df_dax = pd.DataFrame(dax_report_data)
+                df_dax.to_excel(writer, sheet_name='DAX Conversions', index=False)
+                
+                # Sheet 2: Worksheet Analysis
+                df_ws = pd.DataFrame(worksheet_report_data)
+                df_ws.to_excel(writer, sheet_name='Worksheet Analysis', index=False)
 
-            zip_file.writestr("conversion_report.xlsx", excel_buffer.getvalue())
+                # Sheet 3: Data Tables
+                df_tables = pd.DataFrame(tables_report_data)
+                df_tables.to_excel(writer, sheet_name='Data Tables', index=False)
 
-            # 5. Table data Excel files (NEW)
+                # Auto-adjust column widths for all sheets
+                for sheetname in writer.sheets:
+                    worksheet = writer.sheets[sheetname]
+                    for column in worksheet.columns:
+                        max_length = 0
+                        column_letter = column[0].column_letter
+                        for cell in column:
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(str(cell.value))
+                            except: pass
+                        adjusted_width = min(max_length + 2, 80)
+                        worksheet.column_dimensions[column_letter].width = adjusted_width
+
+            excel_buffer.seek(0)
+            zip_file.writestr(f"migration_report_{migration_id}.xlsx", excel_buffer.getvalue())
+
+            # ---------------------------------------------------------
+            # Generate model.bim (Semantic Model)
+            # ---------------------------------------------------------
+            try:
+                # Build valid model.bim structure for Tabular Editor import
+                bim_measures = []
+                for c in conversions:
+                    if c.dax_formula:
+                        bim_measures.append({
+                            "name": get_friendly_name(calc_map.get(c.calc_id).calc_name) if calc_map.get(c.calc_id) else c.calc_id,
+                            "expression": c.dax_formula,
+                            "formatString": "#,##0.00"
+                        })
+
+                model_bim = {
+                    "name": "SemanticModel",
+                    "compatibilityLevel": 1500,
+                    "model": {
+                        "culture": "en-US",
+                        "tables": [
+                            {
+                                "name": "_Calculations", 
+                                "columns": [
+                                    { "name": "Column", "dataType": "string", "sourceColumn": "Column" }
+                                ],
+                                "partitions": [
+                                    {
+                                        "name": "Partition",
+                                        "mode": "import",
+                                        "source": {
+                                            "type": "m",
+                                            "expression": "let\n Source = Table.FromRows(Json.Document(Binary.Decompress(Binary.FromText(\"i44FAA==\", BinaryEncoding.Base64), Compression.Deflate)), let _t = ((type nullable text) meta [Serialized.Text = true]) in type table [Column = _t])\nin\n Source"
+                                        }
+                                    }
+                                ],
+                                "measures": bim_measures
+                            }
+                        ]
+                    }
+                }
+                zip_file.writestr(
+                    "model.bim",
+                    json.dumps(model_bim, indent=2)
+                )
+            except Exception as e:
+                logger.error(f"Failed to generate model.bim: {e}")
+                zip_file.writestr("model_bim_error.txt", f"Failed to generate model.bim: {str(e)}")
+
+            # 5. Table data Excel files (Keep existing behavior)
+            export_dir = Path("exports") / migration_id
             table_data_dir = export_dir / "table_data"
-            logger.info(f"🔍 Checking for table data: {table_data_dir}")
             if table_data_dir.exists():
-                excel_files = list(table_data_dir.glob("*.xlsx"))
-                logger.info(f"📊 Found {len(excel_files)} Excel files")
-                for excel_file in excel_files:
+                for excel_file in table_data_dir.glob("*.xlsx"):
                     zip_file.write(excel_file, f"table_data/{excel_file.name}")
-                    logger.info(f"✅ Added table data: {excel_file.name}")
-            else:
-                logger.warning("⚠️  Table data directory not found")
 
-            # 6. Filter/parameter conversion report
-            filter_report_path = export_dir / "filter_parameter_conversion.md"
-            logger.info(f"🔍 Checking for filter report: {filter_report_path}")
-            if filter_report_path.exists():
-                with open(filter_report_path, 'r', encoding='utf-8') as f:
-                    zip_file.writestr("filter_parameter_conversion.md", f.read())
-                logger.info("✅ Added filter/parameter report")
-            else:
-                logger.warning("⚠️  Filter/parameter report not found")
-
-            # 7. Visual conversion report
-            visual_report_path = export_dir / "visual_conversion.md"
-            logger.info(f"🔍 Checking for visual report: {visual_report_path}")
-            if visual_report_path.exists():
-                with open(visual_report_path, 'r', encoding='utf-8') as f:
-                    zip_file.writestr("visual_conversion.md", f.read())
-                logger.info("✅ Added visual conversion report")
-            else:
-                logger.warning("⚠️  Visual conversion report not found")
-
-            # NOTE: Enhancement guide and recommendations are NOT included (removed as per requirements)
-
-            # 8. README
-            readme = f"# Tableau to Power BI Migration Package\n\n"
-            readme += f"**Migration ID:** {migration_id}\n"
-            readme += f"**Status:** {migration.status.value}\n"
-            readme += f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            readme += "## Contents\n\n"
-            readme += "### Core Files\n"
-            readme += f"- `{migration_id}.pbip/` - Power BI Project folder (text-based, Git-friendly)\n"
-            readme += "- `dax_measures.dax` - All DAX measure definitions\n"
-            readme += "- `migration_metadata.json` - Migration job metadata\n\n"
-            readme += "### Reports & Documentation\n"
-            readme += "- `conversion_report.xlsx` - Detailed conversion report\n"
-            readme += "- `filter_parameter_conversion.md` - Filter & parameter mappings\n"
-            readme += "- `visual_conversion.md` - Visual conversion details\n\n"
-            readme += "### Table Data\n"
-            readme += "- `table_data/` - Exported table data as Excel files\n\n"
-            readme += "## Opening the Migration\n\n"
-            readme += "### Step 1: Extract the ZIP\n"
-            readme += "Extract all contents to a folder on your computer. Keep the folder structure intact.\n\n"
-            readme += "### Step 2: Open in Power BI Desktop\n"
-            readme += "1. Open Power BI Desktop (version 2.120 or later)\n"
-            readme += "2. Click: File → Open → Browse\n"
-            readme += f"3. Navigate to the `{migration_id}.pbip` folder\n"
-            readme += f"4. Select the `.pbip` file inside the folder (e.g., `{migration_id}.pbip`)\n"
-            readme += "5. Power BI will load the project with all measures and data model\n\n"
-            readme += "### Why PBIP?\n"
-            readme += "- ✅ Text-based files (easy to version control with Git)\n"
-            readme += "- ✅ No external dependencies (no Tabular Editor required)\n"
-            readme += "- ✅ Same functionality as PBIX files\n"
-            readme += "- ✅ Modern Power BI standard for CI/CD workflows\n"
-            readme += "- ✅ Easier team collaboration with meaningful diffs\n\n"
-            readme += "## Next Steps\n\n"
-            readme += "1. Review `conversion_report.xlsx` for conversion details\n"
-            readme += "2. Check `filter_parameter_conversion.md` for filter setup\n"
-            readme += "3. Use table data files to load data into Power BI\n"
-            readme += "4. Build report visuals in Power BI Desktop\n"
-            readme += "5. Validate results against original Tableau workbook\n"
-
-            zip_file.writestr("README.md", readme)
-
-            logger.info("=" * 60)
-            logger.info("📦 ZIP PACKAGE SUMMARY:")
-            logger.info(f"   Total files in ZIP: {len(zip_file.namelist())}")
-            for name in zip_file.namelist():
-                logger.info(f"   ✓ {name}")
-            logger.info("=" * 60)
+            # 6. Add minimal update info
+            zip_file.writestr("README.txt", f"Migration Report for {migration_id}\nGenerated: {datetime.now().isoformat()}")
 
         zip_buffer.seek(0)
 
