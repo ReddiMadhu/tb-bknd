@@ -885,6 +885,33 @@ async def export_powerbi_artifacts(migration_id: str):
                 for excel_file in table_data_dir.glob("*.xlsx"):
                     zipf.write(excel_file, f"table_data/{excel_file.name}")
 
+            # ---------------------------------------------------------
+            # Include Existing PBIP File
+            # ---------------------------------------------------------
+            # Path to your actual .pbip file in the backend
+            pbip_source_file = Path("template.pbip")
+            
+            if pbip_source_file.exists():
+                # Write the single file directly into the root of the ZIP
+                zipf.write(pbip_source_file, "migration_project.pbip")
+            else:
+                logger.warning(f"PBIP source file not found at: {pbip_source_file}")
+                # Fallback to dummy if the file doesn't exist yet
+                dummy_pbip_content = json.dumps({
+                    "version": "1.0",
+                    "artifacts": [
+                        {
+                            "report": {
+                                "path": "Report"
+                            }
+                        }
+                    ],
+                    "settings": {
+                        "enableAutoRecovery": True
+                    }
+                }, indent=2)
+                zipf.writestr("migration_project.pbip", dummy_pbip_content)
+
         logger.info(f"Generated artifacts ZIP for {migration_id} at {artifact_path}")
         
     except Exception as e:
