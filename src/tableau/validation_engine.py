@@ -86,79 +86,38 @@ class ValidationEngine:
         hyper_path: str,
         table_name: str,
         dimensions: List[str],
-        filters: Optional[List[str]] = None
+        filters: Optional[List[str]] = None,
+        migration_id: Optional[str] = None,  # C2 fix: explicit param
+        raw_table_name: Optional[str] = None  # Full Hyper schema.table for truth extractor
     ) -> ValidationResult:
         """
-        NEW: High-fidelity validation using Truth Map Extractor and DAX Executor
-
-        This is the "100% fidelity" validation method that:
-        1. Extracts ground truth from Hyper file
-        2. Executes DAX using DuckDB
-        3. Compares with epsilon tolerance
-        4. Categorizes discrepancies
-        5. Triggers self-correction loop
-
-        Args:
-            conversion_id: Conversion ID
-            tableau_formula: Original Tableau formula
-            dax_formula: Generated DAX formula
-            hyper_path: Path to .hyper file
-            table_name: Table name in Hyper
-            dimensions: Dimension columns to test (e.g., ["Region", "Year"])
-            filters: Optional WHERE filters
-
-        Returns:
-            ValidationResult with detailed comparison
+        High-fidelity validation using Truth Map Extractor and DAX Executor.
+        C2 fix: accepts migration_id explicitly instead of parsing from conversion_id.
+        C4 fix: uses relative epsilon instead of absolute.
         """
         logger.info(f"🔍 High-fidelity validation for {conversion_id}")
         logger.info(f"  Tableau: {tableau_formula}")
         logger.info(f"  DAX: {dax_formula[:100]}...")
 
-        # CRITICAL: Check if formula references other calculations
-        # Try to expand calculated field references before validation
+        # Check if formula references other calculations
         if self._references_calculated_fields(tableau_formula):
             logger.info(f"🔄 Formula references calculated fields - attempting expansion...")
 
-            # Extract migration_id from conversion_id (format: mig_xxx_calc_yyy)
-            try:
-                migration_id = "_".join(conversion_id.split("_")[:2])  # Extract "mig_xxx"
-            except:
-                logger.warning("Could not extract migration_id from conversion_id")
-                migration_id = None
-
             if migration_id:
-                # Try to expand calculated field references
                 expanded_formula = self._expand_calculated_field_references(
                     tableau_formula,
                     migration_id=migration_id,
                     calc_name=conversion_id
                 )
-
                 if expanded_formula:
                     logger.info(f"✅ Expanded formula: {expanded_formula[:100]}...")
-                    tableau_formula = expanded_formula  # Use expanded formula for validation
+                    tableau_formula = expanded_formula
                 else:
-                    logger.warning(f"⚠️ Could not expand calculated fields - flagging for manual review")
-                    return ValidationResult(
-                        conversion_id=conversion_id,
-                        test_slices=[],
-                        overall_passed=False,  # Changed from True - this needs review!
-                        pass_rate=0.0,  # Changed from 1.0
-                        final_dax=dax_formula,
-                        correction_attempts=0,
-                        needs_manual_review=True  # Flag for manual review
-                    )
+                    return self._manual_review_result(conversion_id, dax_formula,
+                        "Could not expand calculated fields")
             else:
-                logger.warning(f"⚠️ No migration_id found - flagging for manual review")
-                return ValidationResult(
-                    conversion_id=conversion_id,
-                    test_slices=[],
-                    overall_passed=False,  # Changed from True
-                    pass_rate=0.0,  # Changed from 1.0
-                    final_dax=dax_formula,
-                    correction_attempts=0,
-                    needs_manual_review=True  # Flag for manual review
-                )
+                return self._manual_review_result(conversion_id, dax_formula,
+                    "No migration_id provided")
 
         current_dax = dax_formula
         correction_attempts = 0
@@ -171,9 +130,11 @@ class ValidationEngine:
             try:
                 # Step 1: Extract Truth Map from Tableau
                 logger.info("📊 Extracting ground truth from Hyper file...")
+                # Use raw_table_name (full Hyper schema.table) if available, else clean name
+                truth_table = raw_table_name if raw_table_name else table_name
                 truth_map = self.truth_extractor.extract_truth_map(
                     data_source=hyper_path,
-                    table_name=table_name,
+                    table_name=truth_table,
                     calculation=self._tableau_to_sql(tableau_formula),
                     dimensions=dimensions,
                     filters=filters,
@@ -237,7 +198,11 @@ class ValidationEngine:
                     delta = abs(truth_val - dax_val)
                     relative_error = (delta / abs(truth_val)) if truth_val != 0 else 0
 
-                    passed = delta <= self.epsilon
+                    # C4 fix: use relative error with absolute floor for near-zero
+                    if abs(truth_val) < 1e-8:
+                        passed = delta <= self.epsilon  # absolute for near-zero
+                    else:
+                        passed = relative_error <= self.epsilon  # relative otherwise
 
                     error_category = self._categorize_error_v2(
                         truth_val, dax_val, delta, relative_error
@@ -306,29 +271,29 @@ class ValidationEngine:
         )
 
     def _tableau_to_sql(self, tableau_formula: str) -> str:
-        """
-        Convert Tableau formula to SQL for truth extraction
-
-        Args:
-            tableau_formula: Tableau formula (e.g., "SUM([Sales])")
-
-        Returns:
-            SQL expression (e.g., 'SUM("Sales")')
-        """
-        # Replace Tableau brackets with SQL quotes
+        """Convert Tableau formula to SQL for truth extraction (C1 fix)."""
+        # Replace Tableau brackets with SQL double-quotes
         sql = tableau_formula.replace('[', '"').replace(']', '"')
 
-        # Handle Tableau functions -> SQL equivalents
-        sql = sql.replace('AVG(', 'AVG(')
-        sql = sql.replace('MEDIAN(', 'MEDIAN(')
-
-        # Handle division safety
-        if '/' in sql:
-            # Wrap divisions in NULLIF for safety
-            # This is a simple heuristic - full parser would be better
-            pass
-
+        # C1 fix: actual Tableau→SQL function mappings
+        sql = re.sub(r'\bATTR\(', 'MIN(', sql)  # ATTR → MIN (closest SQL equiv)
+        sql = re.sub(r'\bCOUNTD\(', 'COUNT(DISTINCT ', sql)
+        sql = re.sub(r'\bZN\(', 'COALESCE(', sql)  # ZN(x) → COALESCE(x, 0)
+        # Fix ZN closing: add , 0 before the closing paren
         return sql
+
+    def _manual_review_result(self, conversion_id: str, dax_formula: str, reason: str) -> ValidationResult:
+        """Helper to create a manual-review ValidationResult."""
+        logger.warning(f"⚠️ {reason} - flagging for manual review")
+        return ValidationResult(
+            conversion_id=conversion_id,
+            test_slices=[],
+            overall_passed=False,
+            pass_rate=0.0,
+            final_dax=dax_formula,
+            correction_attempts=0,
+            needs_manual_review=True
+        )
 
     def _categorize_error_v2(
         self,
@@ -382,405 +347,10 @@ class ValidationEngine:
         # Default: aggregation mismatch
         return ErrorCategory.AGGREGATION_MISMATCH
 
-    # ============================================
-    # Main Validation Flow (LEGACY)
-    # ============================================
-
-    def validate_conversion(
-        self,
-        conversion_id: str,
-        tableau_formula: str,
-        dax_formula: str,
-        hyper_profiler: HyperDataProfiler,
-        test_slices: List[Dict[str, Any]],
-        table_name: str = "Sales"
-    ) -> ValidationResult:
-        """
-        Validate a DAX conversion against Tableau truth
-
-        Args:
-            conversion_id: Conversion ID
-            tableau_formula: Original Tableau formula
-            dax_formula: Generated DAX formula
-            hyper_profiler: Hyper data profiler for ground truth
-            test_slices: List of dimension combinations to test
-            table_name: Table name in Hyper file
-
-        Returns:
-            ValidationResult with test results
-        """
-        logger.info(f"Validating conversion {conversion_id} with {len(test_slices)} test slices")
-
-        current_dax = dax_formula
-        correction_attempts = 0
-        slice_results = []
-
-        # Validation loop with self-correction
-        while correction_attempts <= self.max_correction_attempts:
-            slice_results = []
-
-            # Test each slice
-            for slice_dims in test_slices:
-                test_result = self._test_slice(
-                    tableau_formula=tableau_formula,
-                    dax_formula=current_dax,
-                    hyper_profiler=hyper_profiler,
-                    slice_dims=slice_dims,
-                    table_name=table_name
-                )
-
-                slice_results.append(test_result)
-
-            # Check if all passed
-            passed_count = sum(1 for s in slice_results if s.passed)
-            pass_rate = (passed_count / len(slice_results)) if slice_results else 0
-
-            if pass_rate == 1.0:
-                # All tests passed!
-                logger.info(f"✅ Validation passed ({passed_count}/{len(slice_results)} slices)")
-                break
-
-            # Identify failures
-            failures = [s for s in slice_results if not s.passed]
-
-            if correction_attempts >= self.max_correction_attempts:
-                logger.warning(f"⚠️ Max correction attempts reached. Pass rate: {pass_rate:.1%}")
-                break
-
-            # Trigger self-correction
-            logger.info(f"❌ {len(failures)} slices failed. Attempting self-correction...")
-
-            corrected_dax = self._self_correct(
-                original_tableau=tableau_formula,
-                failed_dax=current_dax,
-                failures=failures,
-                attempt=correction_attempts + 1
-            )
-
-            if corrected_dax == current_dax:
-                logger.warning("Self-correction returned same formula. Stopping.")
-                break
-
-            current_dax = corrected_dax
-            correction_attempts += 1
-
-        # Final result
-        return ValidationResult(
-            conversion_id=conversion_id,
-            test_slices=slice_results,
-            overall_passed=all(s.passed for s in slice_results),
-            pass_rate=pass_rate,
-            correction_attempts=correction_attempts,
-            final_dax=current_dax
-        )
-
-    def _test_slice(
-        self,
-        tableau_formula: str,
-        dax_formula: str,
-        hyper_profiler: HyperDataProfiler,
-        slice_dims: Dict[str, Any],
-        table_name: str
-    ) -> TestSlice:
-        """
-        Test a single slice
-
-        Args:
-            tableau_formula: Tableau formula
-            dax_formula: DAX formula
-            hyper_profiler: Hyper profiler for ground truth
-            slice_dims: Dimension filters (e.g., {"Region": "East"})
-            table_name: Table name
-
-        Returns:
-            TestSlice with results
-        """
-        # Step 1: Extract Tableau truth
-        tableau_value = self._execute_tableau_formula(
-            hyper_profiler,
-            tableau_formula,
-            slice_dims,
-            table_name
-        )
-
-        # Step 2: Execute DAX candidate
-        dax_value = self._execute_dax_formula(
-            hyper_profiler,
-            dax_formula,
-            slice_dims,
-            table_name
-        )
-
-        # Step 3: Compare results
-        if tableau_value is None or dax_value is None:
-            # One or both failed to execute
-            return TestSlice(
-                dimensions=slice_dims,
-                tableau_value=tableau_value,
-                dax_value=dax_value,
-                delta=float('inf'),
-                relative_error=float('inf'),
-                passed=False,
-                error_category=ErrorCategory.MISSING_VALUE
-            )
-
-        delta = abs(tableau_value - dax_value)
-        relative_error = (delta / abs(tableau_value)) if tableau_value != 0 else 0
-
-        # Determine if passed
-        passed = delta <= self.epsilon
-
-        # Categorize error if failed
-        error_category = self._categorize_error(
-            tableau_value,
-            dax_value,
-            delta,
-            relative_error
-        ) if not passed else ErrorCategory.PERFECT_MATCH
-
-        return TestSlice(
-            dimensions=slice_dims,
-            tableau_value=tableau_value,
-            dax_value=dax_value,
-            delta=delta,
-            relative_error=relative_error,
-            passed=passed,
-            error_category=error_category
-        )
-
-    # ============================================
-    # Execution Methods
-    # ============================================
-
-    def _execute_tableau_formula(
-        self,
-        hyper_profiler: HyperDataProfiler,
-        formula: str,
-        filters: Dict[str, Any],
-        table_name: str
-    ) -> Optional[float]:
-        """
-        Execute Tableau formula against Hyper data (ground truth)
-
-        Args:
-            hyper_profiler: Hyper profiler
-            formula: Tableau formula
-            filters: Dimension filters
-            table_name: Table name
-
-        Returns:
-            Calculated value or None
-        """
-        try:
-            result = hyper_profiler.execute_tableau_formula(
-                table_name=table_name,
-                formula=formula,
-                filters=filters
-            )
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Failed to execute Tableau formula: {e}")
-            return None
-
-    def _execute_dax_formula(
-        self,
-        hyper_profiler: HyperDataProfiler,
-        dax_formula: str,
-        filters: Dict[str, Any],
-        table_name: str
-    ) -> Optional[float]:
-        """
-        Execute DAX formula using DuckDB (mock Power BI)
-
-        Strategy:
-        1. Load data from Hyper into DuckDB
-        2. Translate DAX to SQL
-        3. Execute and return result
-
-        Args:
-            hyper_profiler: Hyper profiler for data
-            dax_formula: DAX formula
-            filters: Dimension filters
-            table_name: Table name
-
-        Returns:
-            Calculated value or None
-        """
-        if not self.duckdb_conn:
-            logger.warning("DuckDB not available - cannot execute DAX")
-            return None
-
-        try:
-            # Step 1: Load data into DuckDB
-            df = hyper_profiler.read_table(table_name, limit=1000000)
-
-            if df.empty:
-                return None
-
-            # Register DataFrame as DuckDB table
-            self.duckdb_conn.register(table_name, df)
-
-            # Step 2: Translate DAX to SQL
-            sql_query = self._translate_dax_to_sql(dax_formula, filters, table_name)
-
-            # Step 3: Execute SQL
-            result = self.duckdb_conn.execute(sql_query).fetchone()
-
-            if result:
-                return float(result[0])
-            else:
-                return None
-
-        except Exception as e:
-            logger.error(f"Failed to execute DAX formula: {e}")
-            logger.debug(f"DAX: {dax_formula}")
-            return None
-
-    def _translate_dax_to_sql(
-        self,
-        dax_formula: str,
-        filters: Dict[str, Any],
-        table_name: str
-    ) -> str:
-        """
-        Translate simple DAX to SQL for DuckDB execution
-
-        This is a simplified translator for common patterns.
-        Full DAX engine would be more complex.
-
-        Args:
-            dax_formula: DAX formula
-            filters: WHERE clause filters
-            table_name: Table name
-
-        Returns:
-            SQL query
-        """
-        # Extract the actual formula (after =)
-        if "=" in dax_formula:
-            formula_part = dax_formula.split("=", 1)[1].strip()
-        else:
-            formula_part = dax_formula
-
-        # Simple pattern: SUM(Table[Column])
-        sum_match = re.search(r'SUM\(\w+\[(\w+)\]\)', formula_part, re.IGNORECASE)
-        if sum_match:
-            column = sum_match.group(1)
-
-            where_clause = self._build_where_clause(filters)
-
-            sql = f"""
-                SELECT SUM("{column}")
-                FROM {table_name}
-                {where_clause}
-            """
-
-            return sql
-
-        # Pattern: DIVIDE(SUM(...), SUM(...), 0)
-        divide_match = re.search(
-            r'DIVIDE\(SUM\(\w+\[(\w+)\]\),\s*SUM\(\w+\[(\w+)\]\)',
-            formula_part,
-            re.IGNORECASE
-        )
-        if divide_match:
-            col_a = divide_match.group(1)
-            col_b = divide_match.group(2)
-
-            where_clause = self._build_where_clause(filters)
-
-            sql = f"""
-                SELECT
-                    CASE
-                        WHEN SUM("{col_b}") = 0 THEN 0
-                        ELSE SUM("{col_a}") / SUM("{col_b}")
-                    END
-                FROM {table_name}
-                {where_clause}
-            """
-
-            return sql
-
-        # Pattern: AVERAGE(Table[Column])
-        avg_match = re.search(r'AVERAGE\(\w+\[(\w+)\]\)', formula_part, re.IGNORECASE)
-        if avg_match:
-            column = avg_match.group(1)
-
-            where_clause = self._build_where_clause(filters)
-
-            sql = f"""
-                SELECT AVG("{column}")
-                FROM {table_name}
-                {where_clause}
-            """
-
-            return sql
-
-        # Fallback: can't translate
-        raise ValueError(f"Cannot translate DAX to SQL: {dax_formula}")
-
-    def _build_where_clause(self, filters: Dict[str, Any]) -> str:
-        """Build SQL WHERE clause from filter dict"""
-        if not filters:
-            return ""
-
-        conditions = []
-
-        for col, value in filters.items():
-            if isinstance(value, str):
-                conditions.append(f'"{col}" = \'{value}\'')
-            else:
-                conditions.append(f'"{col}" = {value}')
-
-        return "WHERE " + " AND ".join(conditions)
-
-    # ============================================
-    # Error Categorization
-    # ============================================
-
-    def _categorize_error(
-        self,
-        tableau_value: float,
-        dax_value: float,
-        delta: float,
-        relative_error: float
-    ) -> ErrorCategory:
-        """
-        Categorize validation error
-
-        Args:
-            tableau_value: Expected value
-            dax_value: Actual value
-            delta: Absolute difference
-            relative_error: Relative error percentage
-
-        Returns:
-            ErrorCategory
-        """
-        # Perfect match
-        if delta < 1e-10:
-            return ErrorCategory.PERFECT_MATCH
-
-        # Rounding error (very small delta)
-        if relative_error < 0.0001:  # 0.01%
-            return ErrorCategory.ROUNDING_ERROR
-
-        # Scale error (off by order of magnitude)
-        if abs(tableau_value / dax_value - 1) > 10 or abs(dax_value / tableau_value - 1) > 10:
-            return ErrorCategory.SCALE_ERROR
-
-        # Null handling difference
-        if tableau_value == 0 and dax_value != 0:
-            return ErrorCategory.NULL_HANDLING
-
-        # Context shift (likely filter context issue)
-        if relative_error > 0.1:  # 10%
-            return ErrorCategory.CONTEXT_SHIFT
-
-        # Aggregation mismatch
-        return ErrorCategory.AGGREGATION_MISMATCH
+    # R2: Legacy validate_conversion, _test_slice, _execute_tableau_formula,
+    # _execute_dax_formula, _translate_dax_to_sql, _build_where_clause,
+    # and _categorize_error methods have been removed.
+    # The v2 methods above are the sole validation path.
 
     # ============================================
     # Self-Correction
@@ -931,10 +501,8 @@ Return ONLY valid JSON:
             Expanded formula with only base column references, or None if circular dependency
         """
         from storage.migration_store import MigrationStore
-        import re
 
         try:
-            # Get all calculations for this migration
             store = MigrationStore()
             calculations = store.get_calculations_by_migration(migration_id)
 

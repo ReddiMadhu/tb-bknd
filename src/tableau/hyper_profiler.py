@@ -1,4 +1,5 @@
 """Tableau Hyper Data Profiler - Extract and profile data from Tableau extracts"""
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
@@ -64,6 +65,7 @@ class HyperDataProfiler:
             raise FileNotFoundError(f"Hyper file not found: {hyper_file_path}")
 
         self.tables: List[str] = []
+        self.table_name_map: Dict[str, str] = {}  # raw_name → clean_name
         self.profiles: Dict[str, TableProfile] = {}
 
         # Detect if we can use native Hyper API or fallback to DuckDB
@@ -74,6 +76,48 @@ class HyperDataProfiler:
             self._init_duckdb_connection()
 
         self._discover_tables()
+
+    # ============================================
+    # Table Name Normalization
+    # ============================================
+
+    @staticmethod
+    def normalize_hyper_table_name(raw_name: str) -> str:
+        """
+        Normalize a Tableau Hyper table name to a clean, human-readable form.
+
+        Handles:
+        - Schema prefix:  '"Extract"."Fees_762A..."' → 'Fees'
+        - UUID suffix:    'Meeting_C95B177F...41D3A' → 'Meeting'
+        - Multi-word:     'Individual Budget_B25F...' → 'Individual Budget'
+        - Connection `!`:  'gcrm!opportunity!202001231041_90E...' → 'opportunity'
+        """
+        name = raw_name
+
+        # 1. Strip schema prefix (e.g. '"Extract"."Table"' → 'Table')
+        if '.' in name:
+            name = name.split('.')[-1]
+        name = name.strip('"').strip("'")
+
+        # 2. Strip 32-char hex UUID suffix (e.g. _B25F7F09...)
+        name = re.sub(r'_[A-Fa-f0-9]{32}$', '', name)
+
+        # 3. Handle '!' separated connection-based names
+        #    e.g. 'gcrm!opportunity!202001231041' → 'opportunity'
+        if '!' in name:
+            parts = name.split('!')
+            # The actual table name is typically the second segment
+            # Filter out pure numeric/timestamp segments
+            meaningful = [p for p in parts if not re.match(r'^\d+$', p)]
+            name = meaningful[-1] if meaningful else parts[-1]
+
+        # 4. If after all cleaning we end up with just 'Extract', return as-is
+        return name.strip()
+
+    def get_clean_table_name(self, raw_table_name: str) -> str:
+        """Get the normalized name for a raw Hyper table name."""
+        return self.table_name_map.get(raw_table_name,
+            self.normalize_hyper_table_name(raw_table_name))
 
     def _init_duckdb_connection(self):
         """Initialize DuckDB connection as fallback"""
@@ -110,7 +154,9 @@ class HyperDataProfiler:
                     for table in table_names:
                         full_table_name = f"{schema}.{table.name}"
                         self.tables.append(full_table_name)
-                        logger.debug(f"Found table: {full_table_name}")
+                        clean = self.normalize_hyper_table_name(full_table_name)
+                        self.table_name_map[full_table_name] = clean
+                        logger.debug(f"Found table: {full_table_name} → {clean}")
 
     def _discover_tables_duckdb(self):
         """Discover tables using DuckDB (fallback)"""
@@ -143,8 +189,11 @@ class HyperDataProfiler:
         """Read table using native Hyper API"""
         with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
             with Connection(hyper.endpoint, str(self.hyper_file)) as connection:
+                # Completely strip quotes so we can safely add them back
+                clean_table = table_name.replace('"', '').replace("'", "")
+
                 # Parse schema.table
-                parts = table_name.split(".")
+                parts = clean_table.split(".")
                 schema = parts[0] if len(parts) > 1 else "Extract"
                 table = parts[-1]
 
@@ -516,15 +565,15 @@ class HyperDataProfiler:
         """Get row count using Hyper API"""
         with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
             with Connection(hyper.endpoint, str(self.hyper_file)) as connection:
-                parts = table_name.split(".")
+                clean_table = table_name.replace('"', '').replace("'", "")
+                parts = clean_table.split(".")
                 schema = parts[0] if len(parts) > 1 else "Extract"
                 table = parts[-1]
 
                 query = f'SELECT COUNT(*) FROM "{schema}"."{table}"'
-
                 with connection.execute_query(query) as result:
                     for row in result:
-                        return int(row[0])
+                        return row[0]
                 return 0
 
     def _get_row_count_duckdb(self, table_name: str) -> int:
@@ -556,16 +605,22 @@ class HyperDataProfiler:
 
         with HyperProcess(telemetry=telemetry) as hyper:
             with Connection(hyper.endpoint, str(self.hyper_file)) as connection:
-                # Strip quotes from table name if present
-                clean_table = table_name.strip('"')
+                # Completely strip all quotes to get a clean representation
+                clean_table = table_name.replace('"', '').replace("'", "")
 
                 # Try method 1: Query LIMIT 0 to get column metadata
                 try:
-                    query = f'SELECT * FROM {table_name} LIMIT 0'
+                    # Must use standard Hyper quoting: "Schema"."Table"
+                    parts = clean_table.split(".")
+                    if len(parts) >= 2:
+                        # Extract.Table -> "Extract"."Table"
+                        quoted_ref = f'"{parts[0]}"."{parts[1]}"'
+                    else:
+                        quoted_ref = f'"Extract"."{clean_table}"'
+                    query = f'SELECT * FROM {quoted_ref} LIMIT 0'
                     columns = []
 
                     with connection.execute_query(query) as result:
-                        # Get column names from result metadata
                         schema = result.schema
                         for col in schema.columns:
                             columns.append({
@@ -648,7 +703,8 @@ class HyperDataProfiler:
         """Get column uniqueness using Hyper API"""
         with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
             with Connection(hyper.endpoint, str(self.hyper_file)) as connection:
-                parts = table_name.split(".")
+                clean_table = table_name.replace('"', '').replace("'", "")
+                parts = clean_table.split(".")
                 schema = parts[0] if len(parts) > 1 else "Extract"
                 table = parts[-1]
 

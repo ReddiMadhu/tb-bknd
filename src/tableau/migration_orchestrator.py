@@ -1,6 +1,7 @@
 """Migration Orchestrator - Coordinate end-to-end Tableau-to-Power BI migration"""
 import uuid
 import json
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -27,13 +28,10 @@ from src.powerbi.model_enhancement_agent import ModelEnhancementAgent, Enhanceme
 from src.powerbi.enhancement_guide_generator import EnhancementGuideGenerator
 from workers.progress_manager import ProgressCallback
 
-# NEW: Complete migration components (STEPS 5-10)
-from src.powerbi.pbix_injector import PBIXInjector, Measure, Relationship
+# Active migration components
+from src.powerbi.pbix_injector import Measure, Relationship
 from src.powerbi.model_builder import PowerBIModelBuilder, DateTableConfig
-from src.powerbi.table_calc_converter import TableCalculationConverter
 from src.powerbi.filter_parameter_converter import FilterParameterConverter
-from src.powerbi.template_creator import StarterPBIXCreator
-from src.powerbi.visual_converter import VisualConverter
 
 
 class MigrationOrchestrator:
@@ -41,19 +39,14 @@ class MigrationOrchestrator:
     Orchestrate end-to-end migration workflow
 
     Workflow:
-    1. Parse TWB/TWBX files (15% progress)
-    2. Profile Hyper data (30%)
-    3. Build logic graph (45%)
-    4. Generate DAX conversions (70%)
-    5. Validate conversions & build complete model (85%)
-       - Validate DAX conversions
-       - Build data model (relationships, date table)
-       - Convert filters & parameters
-       - Create & inject PBIX
-       - Generate documentation
-       - Export table data to Excel
-    6. Export Power BI artifacts (95%)
-    7. Complete (100%)
+    1. Parse TWB/TWBX files (0-15% progress)
+    2. Profile Hyper data (15-30%)
+    3. Build logic graph (30-45%)
+    4. Generate DAX conversions (45-70%)
+    5. Validate conversions (70-85%)
+    6. Build data model, convert filters, export data (85-95%)
+    7. Generate enhancement guide (if needed) (95%)
+    8. Complete (100%)
     """
 
     def __init__(self):
@@ -64,13 +57,16 @@ class MigrationOrchestrator:
         self.model_agent = ModelEnhancementAgent()  # Table calc agent
         self.model_enhancements: List[ModelEnhancement] = []  # Track all enhancements
 
-        # NEW: Complete migration components (STEPS 5-10)
-        self.pbix_injector = PBIXInjector()
+        # Active model components
         self.model_builder = PowerBIModelBuilder()
-        self.table_calc_converter = TableCalculationConverter()
         self.filter_converter = FilterParameterConverter()
-        self.template_creator = StarterPBIXCreator()
-        self.visual_converter = VisualConverter()
+
+        # Cached profilers — populated during Phase 1, reused across all phases (P1 fix)
+        self._hyper_profilers: Dict[str, HyperDataProfiler] = {}
+        self._base_field_metadata: Dict[str, Dict[str, Any]] = {}
+
+        # Throttle progress updates (P7 fix)
+        self._last_progress_time: float = 0
 
     async def execute_migration(
         self,
@@ -204,12 +200,16 @@ class MigrationOrchestrator:
         progress_callback: Optional[ProgressCallback]
     ) -> List[Dict[str, Any]]:
         """
-        Parse all TWBX files and extract metadata
+        Parse all TWBX files and extract metadata.
+
+        Also caches HyperDataProfiler instances (P1 fix) and eagerly
+        extracts filters/base-field-metadata so the parser can be released (C5 fix).
 
         Returns:
             List of parsed workbook data with calculations
         """
         logger.info("Phase 1: Parsing Tableau workbooks...")
+        phase_start = time.time()
 
         workbooks_data = []
         total_calculations = 0
@@ -220,21 +220,44 @@ class MigrationOrchestrator:
             # Parse TWB
             parser = TableauTWBParser(twbx_path)
 
-            # Extract metadata
+            # Extract ALL metadata up front so parser can be released (C5)
             calculated_fields = parser.parse_calculated_fields()
             lod_expressions = parser.parse_lod_expressions()
             parameters = parser.parse_parameters()
             worksheets = parser.parse_worksheets()
             dashboards = parser.parse_dashboards()
             data_sources = parser.parse_data_sources()
+            filters = parser.parse_filters()  # C5: eagerly parse filters
 
-            # DEBUG: Log Hyper files extracted
+            # Log Hyper files extracted
             logger.info(f"📦 Extracted {len(parser.hyper_files)} Hyper files from TWBX")
-            if parser.hyper_files:
-                for hf in parser.hyper_files:
-                    logger.info(f"   - {hf}")
-            else:
+            if not parser.hyper_files:
                 logger.warning(f"⚠️  No Hyper files found in {Path(twbx_path).name}")
+
+            # P1: Cache HyperDataProfiler for each Hyper file (reused in Phase 2/3/5)
+            for hyper_path in parser.hyper_files:
+                hyper_key = str(hyper_path)
+                if hyper_key not in self._hyper_profilers:
+                    try:
+                        profiler = HyperDataProfiler(hyper_key)
+                        self._hyper_profilers[hyper_key] = profiler
+                        logger.info(f"   📂 Cached profiler for {Path(hyper_path).name}")
+
+                        # P1+Phase3: Pre-extract base field metadata
+                        tables = profiler.list_tables()
+                        for table in tables:
+                            columns = profiler.get_columns(table)
+                            for col in columns:
+                                self._base_field_metadata[col["name"]] = col
+
+                            # Aliased versions for multi-table — use normalizer
+                            clean_table_name = profiler.get_clean_table_name(table)
+                            for col in columns:
+                                aliased_name = f"{col['name']} ({clean_table_name})"
+                                self._base_field_metadata[aliased_name] = col
+
+                    except Exception as e:
+                        logger.error(f"❌ Failed to cache profiler for {hyper_path}: {e}")
 
             # Store workbook metadata
             workbook_id = f"wb_{uuid.uuid4().hex[:8]}"
@@ -243,7 +266,7 @@ class MigrationOrchestrator:
                 "workbook_id": workbook_id,
                 "filename": Path(twbx_path).name,
                 "file_path": twbx_path,
-                "parser": parser,  # Keep parser for later use
+                "filters": filters,  # C5: store pre-parsed filters, release parser
                 "calculated_fields": calculated_fields,
                 "lod_expressions": lod_expressions,
                 "parameters": parameters,
@@ -252,10 +275,11 @@ class MigrationOrchestrator:
                 "data_sources": data_sources,
                 "hyper_files": parser.hyper_files
             }
+            # NOTE: parser is NOT stored — its data has been fully extracted (C5)
 
             workbooks_data.append(workbook)
 
-            # Save to database - create TableauWorkbook object
+            # Save to database
             tableau_workbook = TableauWorkbook(
                 workbook_id=workbook_id,
                 migration_id=migration_id,
@@ -264,7 +288,7 @@ class MigrationOrchestrator:
                 worksheet_count=len(worksheets),
                 dashboard_count=len(dashboards),
                 data_source_count=len(data_sources),
-                extracted_at=None  # Will be set by database
+                extracted_at=None
             )
             self.migration_store.save_workbook(tableau_workbook)
 
@@ -272,7 +296,6 @@ class MigrationOrchestrator:
 
             # Update progress
             progress_pct = 5 + (i + 1) / len(twbx_paths) * 10
-
             self._update_progress(
                 migration_id,
                 MigrationStatus.PARSING,
@@ -288,7 +311,9 @@ class MigrationOrchestrator:
             calculation_count=total_calculations
         )
 
+        logger.info(f"⏱️ Phase 1 completed in {time.time() - phase_start:.1f}s")
         logger.info(f"Parsed {len(workbooks_data)} workbooks with {total_calculations} calculations")
+        logger.info(f"🎯 Cached {len(self._hyper_profilers)} profilers, {len(self._base_field_metadata)} base fields")
 
         return workbooks_data
 
@@ -303,12 +328,14 @@ class MigrationOrchestrator:
         progress_callback: Optional[ProgressCallback]
     ) -> Dict[str, Any]:
         """
-        Profile Hyper data for validation context
+        Profile Hyper data for validation context.
+        Reuses cached HyperDataProfiler instances from Phase 1 (P1 fix).
 
         Returns:
-            Dictionary of data profiles by workbook
+            Dictionary of data profiles by Hyper file path
         """
         logger.info("Phase 2: Profiling Hyper data...")
+        phase_start = time.time()
 
         data_profiles = {}
 
@@ -319,32 +346,30 @@ class MigrationOrchestrator:
 
         if not all_hyper_files:
             logger.warning("No Hyper files found - skipping data profiling")
-
             self._update_progress(
-                migration_id,
-                MigrationStatus.PARSING,
-                30,
-                "No Hyper files found (using live connections)",
-                progress_callback
+                migration_id, MigrationStatus.PARSING, 30,
+                "No Hyper files found (using live connections)", progress_callback
             )
-
             return data_profiles
 
         for i, hyper_path in enumerate(all_hyper_files):
             logger.info(f"Profiling {Path(hyper_path).name}...")
 
             try:
-                profiler = HyperDataProfiler(str(hyper_path))
+                # P1: Reuse cached profiler instead of creating a new one
+                profiler = self._hyper_profilers.get(str(hyper_path))
+                if not profiler:
+                    profiler = HyperDataProfiler(str(hyper_path))
+                    self._hyper_profilers[str(hyper_path)] = profiler
 
-                # Profile first table
                 tables = profiler.list_tables()
 
                 if tables:
                     table_profile = profiler.profile_table(tables[0], sample_size=10000)
-
                     data_profiles[str(hyper_path)] = {
                         "tables": tables,
-                        "primary_table": tables[0],
+                        "primary_table": tables[0],                                    # raw Hyper name
+                        "primary_table_clean": profiler.get_clean_table_name(tables[0]),  # Gap 1: display name
                         "profile": table_profile
                     }
 
@@ -353,15 +378,12 @@ class MigrationOrchestrator:
 
             # Update progress
             progress_pct = 15 + (i + 1) / len(all_hyper_files) * 15
-
             self._update_progress(
-                migration_id,
-                MigrationStatus.PARSING,
-                int(progress_pct),
-                f"Profiled {i + 1}/{len(all_hyper_files)} data sources",
-                progress_callback
+                migration_id, MigrationStatus.PARSING, int(progress_pct),
+                f"Profiled {i + 1}/{len(all_hyper_files)} data sources", progress_callback
             )
 
+        logger.info(f"⏱️ Phase 2 completed in {time.time() - phase_start:.1f}s")
         logger.info(f"Profiled {len(data_profiles)} data sources")
 
         return data_profiles
@@ -377,97 +399,42 @@ class MigrationOrchestrator:
         progress_callback: Optional[ProgressCallback]
     ) -> Dict[str, Any]:
         """
-        Build dependency graph from calculations
+        Build dependency graph from calculations.
+        Uses cached base_field_metadata from Phase 1 (P1 fix — no more Hyper re-opens).
 
         Returns:
             Logic graph with nodes and edges
         """
         logger.info("Phase 3: Building logic graph...")
+        phase_start = time.time()
 
         self._update_progress(
-            migration_id,
-            MigrationStatus.DISCOVERING,
-            35,
-            "Building calculation dependency graph...",
-            progress_callback
+            migration_id, MigrationStatus.DISCOVERING, 35,
+            "Building calculation dependency graph...", progress_callback
         )
 
         # Collect all calculations from all workbooks
         all_calculations = []
         all_lod_expressions = []
         all_worksheets = []
-        base_field_metadata = {}
 
         for wb in workbooks_data:
             all_calculations.extend(wb.get("calculated_fields", []))
             all_lod_expressions.extend(wb.get("lod_expressions", []))
             all_worksheets.extend(wb.get("worksheets", []))
 
-            # Extract base field names from Hyper extract columns
-            hyper_files = wb.get("hyper_files", [])
-            logger.info(f"🔍 Extracting base fields from {len(hyper_files)} Hyper files...")
-
-            if not hyper_files:
-                logger.warning(f"⚠️  Workbook '{wb.get('filename')}' has no Hyper files!")
-                logger.warning(f"   Falling back to extracting table names from data sources")
-                # Fallback: try to get from data sources
+            # Fallback for workbooks without Hyper files
+            if not wb.get("hyper_files"):
                 for ds in wb.get("data_sources", []):
-                    # For fallback, we just mark as UNKNOWN type
                     for table in ds.tables:
-                        base_field_metadata[table] = {"name": table, "generic_type": "UNKNOWN"}
-                    logger.info(f"   Added {len(ds.tables)} table names: {ds.tables}")
-                continue
+                        if table not in self._base_field_metadata:
+                            self._base_field_metadata[table] = {"name": table, "generic_type": "UNKNOWN"}
 
-            for hyper_path in hyper_files:
-                try:
-                    from src.tableau.hyper_profiler import HyperDataProfiler
+        # P1: Use cached base_field_metadata (populated in Phase 1)
+        base_field_metadata = self._base_field_metadata
 
-                    logger.info(f"📂 Profiling Hyper file: {hyper_path}")
-                    profiler = HyperDataProfiler(str(hyper_path))
-                    tables = profiler.list_tables()
-                    logger.info(f"📊 Found {len(tables)} tables: {tables}")
-
-                    # Get columns from all tables
-                    for table in tables:
-                        columns = profiler.get_columns(table)
-                        # Extract column names and metadata
-                        for col in columns:
-                            col_name = col["name"]
-                            base_field_metadata[col_name] = col
-                            
-                        column_names = [col["name"] for col in columns]
-                        logger.info(f"✅ Extracted {len(column_names)} base columns from {table}")
-
-                        # Also add aliased versions (for multi-table scenarios)
-                        # Extract clean table name from full path: "Extract"."Fees_XXX" -> "Fees"
-                        table_parts = table.strip('"').split(".")
-                        table_name = table_parts[-1] if table_parts else table
-                        # Strip any remaining quotes from table name
-                        table_name = table_name.strip('"')
-                        # Remove UUID suffix: "Fees_762A3DD4A32A4BEC8ACBE302CE7DD2BF" -> "Fees"
-                        clean_table_name = table_name.split("_")[0] if "_" in table_name else table_name
-
-                        # Add aliased column names: "Amount" -> "Amount (Fees)"
-                        for col_name in column_names:
-                            aliased_name = f"{col_name} ({clean_table_name})"
-                            # Use same metadata for aliased version
-                            base_field_metadata[aliased_name] = base_field_metadata[col_name]
-
-                except Exception as e:
-                    logger.error(f"❌ Failed to extract columns from {hyper_path}: {e}")
-                    logger.error(f"   Falling back to table names only")
-                    # Fallback: try to get from data sources
-                    for ds in wb.get("data_sources", []):
-                         for table in ds.tables:
-                            base_field_metadata[table] = {"name": table, "generic_type": "UNKNOWN"}
-                         logger.warning(f"   Fallback: Added table names: {ds.tables}")
-
-        # Log final base_fields summary
-        logger.info(f"🎯 BASE FIELDS REGISTRY COMPLETE: {len(base_field_metadata)} total fields")
-        if base_field_metadata:
-            sample_fields = list(base_field_metadata.keys())[:15]
-            logger.info(f"   Sample fields: {', '.join(sample_fields)}{'...' if len(base_field_metadata) > 15 else ''}")
-        else:
+        logger.info(f"🎯 Using {len(base_field_metadata)} cached base fields")
+        if not base_field_metadata:
             logger.error(f"⚠️  WARNING: No base fields found! All dependencies will be marked UNKNOWN!")
 
         # Build graph
@@ -554,48 +521,47 @@ class MigrationOrchestrator:
         progress_callback: Optional[ProgressCallback]
     ) -> List[Dict[str, Any]]:
         """
-        Generate DAX for all calculations
+        Generate DAX for all calculations.
+        P3 fix: fetches calculations once before loop.
 
         Returns:
             List of conversion results
         """
         logger.info("Phase 4: Generating DAX conversions...")
+        phase_start = time.time()
 
         self._update_progress(
-            migration_id,
-            MigrationStatus.CONVERTING,
-            50,
-            "Generating DAX formulas using AI...",
-            progress_callback
+            migration_id, MigrationStatus.CONVERTING, 50,
+            "Generating DAX formulas using AI...", progress_callback
         )
 
         graph_builder = logic_graph["builder"]
         execution_order = logic_graph["execution_order"]
 
+        # P3 fix: fetch calculations ONCE, build lookup dict
+        all_calculations = self.migration_store.get_calculations_by_migration(migration_id)
+        calc_lookup = {c.calc_name: c for c in all_calculations}
+
+        # Pre-compute table name from first profile (shared across all calcs)
+        first_profile_data = next(iter(data_profiles.values()), {}) if data_profiles else {}
+        data_profile = first_profile_data.get("profile")
+        # Gap 1 fix: use pre-normalized clean name stored in Phase 2
+        actual_table_name = first_profile_data.get("primary_table_clean")
+        if not actual_table_name:
+            # Fallback: normalize raw name on the fly
+            raw_table_name = first_profile_data.get("primary_table")
+            actual_table_name = HyperDataProfiler.normalize_hyper_table_name(raw_table_name) if raw_table_name else None
+        if actual_table_name and actual_table_name.lower() == "extract":
+            actual_table_name = None
+
         conversions = []
 
         for i, calc_name in enumerate(execution_order):
             calc_node = graph_builder.get_calculation_node(calc_name)
-
             if not calc_node:
                 continue
 
             logger.info(f"Generating DAX for: {calc_name}")
-
-            # Get data profile and table name (use first available)
-            first_profile_data = next(iter(data_profiles.values()), {}) if data_profiles else {}
-            data_profile = first_profile_data.get("profile")
-            
-            # Detect table name (default to None if not found)
-            actual_table_name = first_profile_data.get("primary_table")
-            
-            # If table name has schema (e.g. "Extract"."Table"), clean it
-            if actual_table_name and "." in actual_table_name:
-                actual_table_name = actual_table_name.split(".")[-1].strip('"')
-
-            # Filter out generic "Extract" table name
-            if actual_table_name and actual_table_name.lower() == "extract":
-                actual_table_name = None
 
             # Generate DAX
             dax_result = self.dax_generator.tableau_to_dax(
@@ -604,11 +570,10 @@ class MigrationOrchestrator:
                 table_name=actual_table_name or ""
             )
 
-            # NEW: Check if table calculation requires model enhancement
+            # Check if table calculation requires model enhancement
             model_enhancement = None
             if calc_node.calc_type == GraphCalculationType.TABLE_CALCULATION:
                 logger.info(f"  → Detected table calculation, checking model requirements...")
-
                 model_enhancement = self.model_agent.assess_table_calculation(
                     tableau_formula=calc_node.formula,
                     calc_name=calc_name,
@@ -616,36 +581,22 @@ class MigrationOrchestrator:
                     sort_by=calc_node.visual_context.sort_by if calc_node.visual_context else [],
                     table_name=actual_table_name or ""
                 )
-
                 if model_enhancement:
                     logger.warning(f"  ⚠️ Requires model enhancement: {model_enhancement.enhancement_type.value}")
-                    logger.info(f"     Reason: {model_enhancement.reason}")
-
-                    # Store enhancement for export
                     self.model_enhancements.append(model_enhancement)
-
-                    # Use enhanced DAX if provided
                     if model_enhancement.dax_code:
-                        logger.info(f"  ✓ Using enhanced DAX from model agent")
                         dax_result.dax_formula = model_enhancement.dax_code
                         dax_result.warnings.append(f"Requires model enhancement: {model_enhancement.enhancement_type.value}")
 
-            # Store conversion
+            # Store conversion — P3 fix: use pre-fetched lookup instead of re-querying
             conversion_id = f"conv_{uuid.uuid4().hex[:8]}"
-
-            # Get calc_id from database (fetch by name)
-            calculations = self.migration_store.get_calculations_by_migration(migration_id)
-            matching_calc = next((c for c in calculations if c.calc_name == calc_name), None)
+            matching_calc = calc_lookup.get(calc_name)
 
             if matching_calc:
-                # Prepare warnings list
                 warnings_list = dax_result.warnings if dax_result.warnings else []
-
-                # Add model enhancement info to warnings if applicable
                 if model_enhancement:
                     warnings_list.append(f"MODEL_ENHANCEMENT_REQUIRED: {model_enhancement.enhancement_type.value}")
 
-                # Create DAXConversion object
                 dax_conversion = DAXConversion(
                     conversion_id=conversion_id,
                     calc_id=matching_calc.calc_id,
@@ -656,7 +607,7 @@ class MigrationOrchestrator:
                     reasoning=dax_result.reasoning,
                     warnings=json.dumps(warnings_list) if warnings_list else None,
                     status=ConversionStatus.PENDING,
-                    created_at=None  # Will be set by database
+                    created_at=None
                 )
                 self.migration_store.save_conversion(dax_conversion)
 
@@ -664,20 +615,17 @@ class MigrationOrchestrator:
                     "conversion_id": conversion_id,
                     "calc_name": calc_name,
                     "dax_result": dax_result,
-                    "model_enhancement": model_enhancement  # NEW: Include enhancement
+                    "model_enhancement": model_enhancement
                 })
 
             # Update progress
             progress_pct = 50 + (i + 1) / len(execution_order) * 20
-
             self._update_progress(
-                migration_id,
-                MigrationStatus.CONVERTING,
-                int(progress_pct),
-                f"Generated DAX for {i + 1}/{len(execution_order)} calculations",
-                progress_callback
+                migration_id, MigrationStatus.CONVERTING, int(progress_pct),
+                f"Generated DAX for {i + 1}/{len(execution_order)} calculations", progress_callback
             )
 
+        logger.info(f"⏱️ Phase 4 completed in {time.time() - phase_start:.1f}s")
         logger.info(f"Generated {len(conversions)} DAX conversions")
 
         return conversions
@@ -694,24 +642,15 @@ class MigrationOrchestrator:
         progress_callback: Optional[ProgressCallback]
     ) -> Dict[str, Any]:
         """
-        Validate DAX conversions and build complete Power BI model
-
-        Phase 5 includes:
-        - 100% fidelity validation (75-80%)
-        - Build data model (80-82%)
-        - Convert filters & parameters (82-84%)
-        - Create & inject PBIX (84-88%)
-        - Export table data to Excel (88-90%)
-        - Generate documentation (90-95%)
+        Validate DAX conversions and build complete Power BI model.
+        P1: Uses cached profiler. P3: Fetches calculations once.
         """
         logger.info("Phase 5: Validating conversions & building complete model...")
+        phase_start = time.time()
 
         self._update_progress(
-            migration_id,
-            MigrationStatus.VALIDATING,
-            75,
-            "Running 100% fidelity validation...",
-            progress_callback
+            migration_id, MigrationStatus.VALIDATING, 75,
+            "Running 100% fidelity validation...", progress_callback
         )
 
         # Collect Hyper files for validation
@@ -721,14 +660,11 @@ class MigrationOrchestrator:
 
         if not hyper_files:
             logger.warning("No Hyper files found - skipping fidelity validation")
-
-            # Mark all as validated (without numerical validation)
             for conversion in conversions:
                 self.migration_store.update_conversion(
                     conversion_id=conversion["conversion_id"],
                     status=ConversionStatus.VALIDATED
                 )
-
             return {
                 "validated_count": len(conversions),
                 "perfect_matches": 0,
@@ -736,26 +672,32 @@ class MigrationOrchestrator:
                 "message": "No Hyper files available for validation"
             }
 
-        # Use first Hyper file for validation
+        # P1: Reuse cached profiler to detect table name
         hyper_path = hyper_files[0]
         logger.info(f"Using Hyper file for validation: {Path(hyper_path).name}")
 
-        # Detect actual table name from Hyper file
         try:
-            from src.tableau.hyper_profiler import HyperDataProfiler
-            profiler = HyperDataProfiler(str(hyper_path))
+            profiler = self._hyper_profilers.get(str(hyper_path))
+            if not profiler:
+                profiler = HyperDataProfiler(str(hyper_path))
+                self._hyper_profilers[str(hyper_path)] = profiler
             available_tables = profiler.list_tables()
-
             if available_tables:
-                # Use first table found
-                actual_table_name = available_tables[0]
-                logger.info(f"Detected table name: {actual_table_name}")
+                # Keep raw name for Hyper API queries, clean name for display/DAX
+                raw_table_name = available_tables[0]   # e.g. '"Extract"."Fees_762A..."'
+                actual_table_name = profiler.get_clean_table_name(available_tables[0])  # e.g. 'Fees'
             else:
-                logger.warning("No tables found in Hyper file - using default")
+                raw_table_name = None
                 actual_table_name = "Extract"
+            logger.info(f"Detected table name: {actual_table_name} (raw: {raw_table_name})")
         except Exception as e:
             logger.warning(f"Could not detect table name: {e} - using default")
+            raw_table_name = None
             actual_table_name = "Extract"
+
+        # P3: Fetch calculations ONCE, build lookup
+        all_calculations = self.migration_store.get_calculations_by_migration(migration_id)
+        calc_lookup = {c.calc_name: c for c in all_calculations}
 
         validated_count = 0
         perfect_matches = 0
@@ -763,14 +705,11 @@ class MigrationOrchestrator:
 
         for i, conversion in enumerate(conversions):
             try:
-                # Get calculation details
                 calc_name = conversion["calc_name"]
                 dax_result = conversion["dax_result"]
 
-                # Get original Tableau formula
-                calculations = self.migration_store.get_calculations_by_migration(migration_id)
-                matching_calc = next((c for c in calculations if c.calc_name == calc_name), None)
-
+                # P3: Use pre-fetched lookup
+                matching_calc = calc_lookup.get(calc_name)
                 if not matching_calc:
                     logger.warning(f"Cannot find calculation {calc_name} - skipping validation")
                     continue
@@ -789,51 +728,48 @@ class MigrationOrchestrator:
                 # Run 100% fidelity validation
                 validation_result = self.validation_engine.validate_conversion_v2(
                     conversion_id=conversion["conversion_id"],
-                    tableau_formula=matching_calc.calc_formula or "SUM([Sales])",  # Use actual formula
+                    tableau_formula=matching_calc.calc_formula or "SUM([Sales])",
                     dax_formula=dax_result.dax_formula,
                     hyper_path=str(hyper_path),
-                    table_name=actual_table_name,  # Use detected table name
-                    dimensions=[],  # No dimensions for simple aggregations
-                    filters=None
+                    table_name=actual_table_name,
+                    raw_table_name=raw_table_name,  # Full Hyper name for truth extractor
+                    dimensions=[],
+                    filters=None,
+                    migration_id=migration_id  # C2 fix: pass migration_id explicitly
                 )
 
-                # Save validation results to database
+                # Save validation results
                 validation_id = self.fidelity_store.save_validation_result(
                     migration_id=migration_id,
                     conversion_id=conversion["conversion_id"],
                     validation_result=validation_result
                 )
-
                 logger.info(f"✅ Saved validation {validation_id} - Pass rate: {validation_result.pass_rate:.1%}")
 
                 # Update conversion with final DAX (may have been corrected)
                 if validation_result.final_dax != dax_result.dax_formula:
-                    logger.info(f"📝 Updating conversion with corrected DAX")
                     self.migration_store.update_conversion(
                         conversion_id=conversion["conversion_id"],
                         dax_formula=validation_result.final_dax
                     )
 
-                # Update conversion status based on validation result
+                # Update status based on validation result
                 if validation_result.needs_manual_review:
-                    # Validation was skipped or had issues - needs human review
                     self.migration_store.update_conversion(
                         conversion_id=conversion["conversion_id"],
                         status=ConversionStatus.MANUAL_REVIEW
                     )
                     logger.warning(f"⚠️ Flagged for manual review: {calc_name}")
                 elif validation_result.overall_passed:
-                    # Validation passed - mark as validated
                     self.migration_store.update_conversion(
                         conversion_id=conversion["conversion_id"],
                         status=ConversionStatus.VALIDATED
                     )
                     perfect_matches += 1
                 else:
-                    # Validation failed - keep as pending for retry
                     self.migration_store.update_conversion(
                         conversion_id=conversion["conversion_id"],
-                        status=ConversionStatus.PENDING  # Keep as pending if not perfect
+                        status=ConversionStatus.PENDING
                     )
 
                 validated_count += 1
@@ -853,21 +789,16 @@ class MigrationOrchestrator:
 
             except Exception as e:
                 logger.error(f"Validation failed for {conversion['calc_name']}: {e}")
-                # Continue with next conversion
 
             # Update progress
             progress_pct = 75 + (i + 1) / len(conversions) * 10
-
             self._update_progress(
-                migration_id,
-                MigrationStatus.VALIDATING,
-                int(progress_pct),
-                f"Validated {i + 1}/{len(conversions)} conversions",
-                progress_callback
+                migration_id, MigrationStatus.VALIDATING, int(progress_pct),
+                f"Validated {i + 1}/{len(conversions)} conversions", progress_callback
             )
 
         avg_pass_rate = total_pass_rate / validated_count if validated_count > 0 else 0
-
+        logger.info(f"⏱️ Phase 5 validation completed in {time.time() - phase_start:.1f}s")
         logger.info(f"✅ Validation complete: {perfect_matches}/{validated_count} perfect matches (avg {avg_pass_rate:.1%})")
 
         # ============================================
@@ -1041,34 +972,25 @@ class MigrationOrchestrator:
         workbooks_data: List[Dict[str, Any]],
         progress_callback: Optional[ProgressCallback]
     ) -> Dict[str, Any]:
-        """Convert Tableau filters and parameters to Power BI"""
+        """Convert Tableau filters and parameters to Power BI.
+        C5 follow-up: reads pre-parsed filters from workbook dict (parser is released).
+        """
+        logger.info("Converting filters and parameters...")
 
-        logger.info("Phase 7: Converting filters and parameters...")
-
-        # Collect all filters and parameters
         all_filters = []
         all_parameters = []
         all_worksheets = []
 
         for wb in workbooks_data:
-            # Collect worksheets
             all_worksheets.extend(wb.get("worksheets", []))
-
-            # Get filters from parser
-            parser = wb.get("parser")
-            if parser:
-                filters = parser.parse_filters()
-                all_filters.extend(filters)
-
+            # C5: Use pre-parsed filters instead of calling parser
+            all_filters.extend(wb.get("filters", []))
             all_parameters.extend(wb.get("parameters", []))
 
-        # Convert filters
         powerbi_filters = self.filter_converter.convert_filters(
             all_filters,
             worksheets=[ws.name for ws in all_worksheets]
         )
-
-        # Convert parameters
         param_conversion = self.filter_converter.convert_parameters(all_parameters)
 
         logger.info(
@@ -1208,100 +1130,8 @@ class MigrationOrchestrator:
             traceback.print_exc()
             return None
 
-    def _export_dax_fallback(
-        self,
-        measures: List[Measure],
-        export_dir: Path
-    ):
-        """Export DAX measures to .dax file as fallback (legacy, kept for compatibility)"""
-
-        dax_file = export_dir / "measures.dax"
-
-        with open(dax_file, 'w', encoding='utf-8') as f:
-            f.write("/* ============================================\n")
-            f.write("   POWER BI DAX MEASURES\n")
-            f.write("   Generated from Tableau Migration\n")
-            f.write(f"   Generated: {datetime.now().isoformat()}\n")
-            f.write("   ============================================ */\n\n")
-
-            for measure in measures:
-                f.write(f"-- {measure.name}\n")
-                if measure.description:
-                    f.write(f"-- {measure.description}\n")
-                f.write(f"{measure.name} = {measure.expression}\n\n")
-
-        logger.info(f"✓ Exported {len(measures)} measures to: {dax_file}")
-
-    def _generate_migration_documentation(
-        self,
-        migration_id: str,
-        workbooks_data: List[Dict[str, Any]],
-        filter_param_results: Dict[str, Any],
-        export_dir: Path
-    ):
-        """Generate migration documentation reports"""
-
-        logger.info("Generating migration documentation...")
-
-        try:
-            # Collect all worksheets
-            all_worksheets = []
-            all_filters = []
-            all_parameters = []
-
-            for wb in workbooks_data:
-                all_worksheets.extend(wb.get("worksheets", []))
-                all_parameters.extend(wb.get("parameters", []))
-
-                # Get filters from parser
-                parser = wb.get("parser")
-                if parser:
-                    filters = parser.parse_filters()
-                    all_filters.extend(filters)
-
-            # Filter/parameter conversion report
-            try:
-                filter_report = self.filter_converter.generate_conversion_report(
-                    tableau_filters=all_filters,
-                    tableau_parameters=all_parameters,
-                    powerbi_filters=filter_param_results.get("filters", []),
-                    whatif_parameters=filter_param_results.get("whatif_parameters", []),
-                    slicer_tables=filter_param_results.get("slicer_tables", [])
-                )
-
-                filter_report_path = export_dir / "filter_parameter_conversion.md"
-
-                with open(filter_report_path, 'w', encoding='utf-8') as f:
-                    f.write(filter_report)
-
-                logger.info(f"✓ Filter/parameter report: {filter_report_path}")
-            except Exception as e:
-                logger.error(f"Failed to generate filter/parameter report: {e}")
-
-            # Visual conversion report
-            try:
-                powerbi_visuals = self.visual_converter.convert_worksheets_to_visuals(
-                    worksheets=all_worksheets,
-                    auto_layout=True
-                )
-
-                visual_report = self.visual_converter.generate_visual_conversion_report(
-                    worksheets=all_worksheets,
-                    visuals=powerbi_visuals
-                )
-
-                visual_report_path = export_dir / "visual_conversion.md"
-
-                with open(visual_report_path, 'w', encoding='utf-8') as f:
-                    f.write(visual_report)
-
-                logger.info(f"✓ Visual conversion report: {visual_report_path}")
-            except Exception as e:
-                logger.error(f"Failed to generate visual conversion report: {e}")
-
-        except Exception as e:
-            logger.error(f"Failed to generate documentation: {e}")
-            # Don't fail the entire migration if documentation generation fails
+    # R4+R2: Removed _export_dax_fallback (never called) and
+    # _generate_migration_documentation (used removed VisualConverter).
 
     def _export_table_data_to_excel(
         self,
@@ -1309,8 +1139,9 @@ class MigrationOrchestrator:
         workbooks_data: List[Dict[str, Any]],
         progress_callback: Optional[ProgressCallback]
     ) -> List[str]:
-        """Export all table data from Hyper files to Excel"""
-
+        """Export all table data from Hyper files to Excel.
+        P1: Reuses cached profilers.
+        """
         logger.info("Exporting table data to Excel...")
 
         export_dir = Path("exports") / migration_id / "table_data"
@@ -1318,7 +1149,6 @@ class MigrationOrchestrator:
 
         excel_files = []
 
-        # Collect all Hyper files
         all_hyper_files = []
         for wb in workbooks_data:
             all_hyper_files.extend(wb.get("hyper_files", []))
@@ -1329,42 +1159,34 @@ class MigrationOrchestrator:
 
         try:
             import pandas as pd
-            from src.tableau.hyper_profiler import HyperDataProfiler
 
-            # Use HyperDataProfiler which handles Hyper API correctly
             for hyper_path in all_hyper_files:
                 try:
                     logger.info(f"Processing Hyper file: {Path(hyper_path).name}")
-                    profiler = HyperDataProfiler(str(hyper_path))
+                    # P1: Reuse cached profiler
+                    profiler = self._hyper_profilers.get(str(hyper_path))
+                    if not profiler:
+                        profiler = HyperDataProfiler(str(hyper_path))
+                        self._hyper_profilers[str(hyper_path)] = profiler
 
-                    # Get all tables
                     tables = profiler.list_tables()
-                    logger.info(f"Found {len(tables)} tables in Hyper file")
 
                     for table_name in tables:
                         try:
-                            # Remove quotes from table name for read_table() method
-                            # list_tables() returns: "Extract"."TableName"
-                            # read_table() expects: Extract.TableName
                             unquoted_table = table_name.replace('"', '')
-
-                            # Read table data
                             df = profiler.read_table(unquoted_table)
 
                             if df is not None and len(df) > 0:
-                                # Clean table name for filename (remove schema prefix and special chars)
-                                clean_name = table_name.replace('"', '').replace('.', '_').replace('!', '_')
+                                # Use normalizer for clean filename
+                                clean_name = profiler.get_clean_table_name(table_name)
+                                clean_name = clean_name.replace(' ', '_').replace('!', '_')
                                 excel_filename = f"{clean_name}.xlsx"
                                 excel_path = export_dir / excel_filename
-
-                                # Save to Excel
                                 df.to_excel(excel_path, index=False, engine='openpyxl')
-
                                 excel_files.append(str(excel_path))
-                                logger.info(f"✓ Exported {len(df)} rows from {table_name} to {excel_filename}")
+                                logger.info(f"✓ Exported {len(df)} rows to {excel_filename}")
                             else:
-                                logger.warning(f"Table {table_name} is empty, skipping export")
-
+                                logger.warning(f"Table {table_name} is empty, skipping")
                         except Exception as e:
                             logger.warning(f"Failed to export table {table_name}: {e}")
 
@@ -1373,10 +1195,8 @@ class MigrationOrchestrator:
 
         except ImportError as e:
             logger.warning(f"Required libraries not available for Excel export: {e}")
-            logger.info("Install with: pip install pandas openpyxl")
 
         logger.info(f"✓ Exported {len(excel_files)} tables to Excel")
-
         return excel_files
 
     # ============================================
@@ -1391,22 +1211,32 @@ class MigrationOrchestrator:
         message: str,
         progress_callback: Optional[ProgressCallback]
     ):
-        """Update migration progress"""
-        # Update database - status only
-        self.migration_store.update_migration_status(
-            migration_id,
-            status
+        """Update migration progress.
+        P7 fix: Throttled to max once per 2 seconds to reduce DB writes.
+        Always writes for status changes and 100% completion.
+        """
+        now = time.time()
+        elapsed = now - self._last_progress_time
+
+        # Always write on status milestones or when enough time has passed
+        should_write = (
+            elapsed >= 2.0
+            or progress_percent >= 100
+            or progress_percent <= 5
         )
 
-        # Update progress with current stage
-        self.migration_store.update_migration_progress(
-            migration_id,
-            progress_percent,
-            current_stage=message,
-            message=message
-        )
+        if should_write:
+            # P7: Single combined update instead of two separate DB calls
+            self.migration_store.update_migration_status(migration_id, status)
+            self.migration_store.update_migration_progress(
+                migration_id,
+                progress_percent,
+                current_stage=message,
+                message=message
+            )
+            self._last_progress_time = now
 
-        # Call progress callback (for WebSocket broadcasting)
+        # Always call WebSocket callback for real-time UI updates
         if progress_callback:
             progress_callback.increment(message)
 

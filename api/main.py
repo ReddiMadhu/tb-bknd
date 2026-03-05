@@ -1,4 +1,6 @@
 """FastAPI application for Excel Relationship Discovery"""
+import sys
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -7,6 +9,39 @@ from loguru import logger
 
 from api.config import config
 from storage.database import init_database
+
+# ─── Logging Configuration ────────────────────────────────────────────────────
+# Change LOG_LEVEL to "WARNING" or "INFO" to see more output
+LOG_LEVEL = "ERROR"
+
+# 1. Replace loguru's default DEBUG sink with ERROR-only
+logger.remove()
+logger.add(
+    sys.stderr,
+    level=LOG_LEVEL,
+    format="<red>{time:HH:mm:ss}</red> | <level>{level: <8}</level> | "
+           "<cyan>{name}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    colorize=True,
+)
+
+# 2. Intercept standard `logging` (uvicorn, FastAPI, SQLAlchemy) → loguru
+class _InterceptHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord):
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        frame, depth = logging.currentframe(), 2
+        while frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+logging.basicConfig(handlers=[_InterceptHandler()], level=logging.ERROR, force=True)
+for noisy_logger in ("uvicorn", "uvicorn.access", "uvicorn.error", "fastapi"):
+    logging.getLogger(noisy_logger).handlers = [_InterceptHandler()]
+    logging.getLogger(noisy_logger).propagate = False
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 @asynccontextmanager

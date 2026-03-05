@@ -156,6 +156,11 @@ class PowerBIModelBuilder:
             logger.warning(f"Incomplete relationship info: {expression}")
             return None
 
+        # Gap 5: normalize table names — strip UUID suffixes, schema prefixes, ! separators
+        from src.tableau.hyper_profiler import HyperDataProfiler
+        from_table = HyperDataProfiler.normalize_hyper_table_name(from_table)
+        to_table = HyperDataProfiler.normalize_hyper_table_name(to_table)
+
         return {
             "from_table": from_table,
             "from_column": from_column,

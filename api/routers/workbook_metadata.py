@@ -82,7 +82,11 @@ async def get_workbook_metadata_summary(migration_id: str):
                     "parameter_count": len(parameters),
                     "data_source_count": len(data_sources),
                     "table_count": len(table_names),
-                    "table_names": table_names
+                    # Gap 6: provide clean display names alongside raw internal names
+                    "table_names": [
+                        profiler.get_clean_table_name(t) for t in table_names
+                    ] if table_names else [],
+                    "table_names_raw": table_names
                 })
 
             except Exception as e:
@@ -607,8 +611,11 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                                         "nullable": bool(col_profile.null_count > 0)
                                     })
 
+                                # Gap 6: add clean display_name to table_detail
+                                display_name = profiler.get_clean_table_name(table)
                                 table_detail = {
-                                    "table_name": str(table),
+                                    "table_name": str(table),       # raw internal name
+                                    "display_name": display_name,    # human-readable name
                                     "row_count": int(row_count),
                                     "columns": columns_info,
                                     "column_details": columns_info,  # Frontend expects this field name

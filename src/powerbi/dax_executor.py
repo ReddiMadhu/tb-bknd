@@ -69,14 +69,16 @@ class DAXExecutor:
                 if not tables:
                     raise Exception(f"No tables found in Hyper file: {self.data_source}")
 
-                # Load first table
+                # Load first table (raw name)
                 table_name = tables[0]
 
                 # CRITICAL: Remove quotes from table name before reading
                 # HyperDataProfiler.read_table() expects unquoted table names
                 clean_table_name = table_name.replace('"', '').replace("'", '')
 
-                logger.info(f"Reading table: {clean_table_name}")
+                # Gap 4: use normalized display name in logs only
+                display_name = profiler.get_clean_table_name(table_name)
+                logger.info(f"Reading table: {display_name} (raw: {clean_table_name})")
                 df = profiler.read_table(clean_table_name)
 
                 # Store original table name for reference
@@ -86,7 +88,7 @@ class DAXExecutor:
                 # Use simple "data" as table name in DuckDB
                 self.con.execute("CREATE TABLE data AS SELECT * FROM df")
 
-                logger.info(f"✅ Loaded Hyper table '{clean_table_name}' into DuckDB ({len(df)} rows)")
+                logger.info(f"✅ Loaded Hyper table '{display_name}' into DuckDB ({len(df)} rows)")
 
             elif self.data_source.endswith('.parquet'):
                 self.con.execute(f"CREATE TABLE data AS SELECT * FROM '{self.data_source}'")
@@ -183,22 +185,27 @@ class DAXExecutor:
         Convert simple DAX to SQL equivalent
 
         Supported patterns:
+        - MeasureName = expression → strip the LHS declaration
         - SUM([Column]) -> SUM("Column")
         - AVERAGE([Column]) -> AVG("Column")
         - COUNT([Column]) -> COUNT("Column")
-        - DIVIDE([A], [B]) -> SUM("A") / NULLIF(SUM("B"), 0)
+        - DIVIDE([A], [B], 0) -> SUM("A") / NULLIF(SUM("B"), 0)
         - Simple arithmetic: [Sales] - [Cost] -> SUM("Sales") - SUM("Cost")
-
-        Note: Complex DAX (CALCULATE, FILTER, etc.) requires advanced parsing
         """
-        sql = dax_formula
+        import re
+        sql = dax_formula.strip()
+
+        # Strip measure-name prefix: "MeasureName = expression" → "expression"
+        # DAX measures are stored as full declarations; extract only the formula part.
+        # Pattern: identifier (possibly with spaces) followed by ' = '
+        # Only strip if the LHS looks like an identifier (not an expression)
+        sql = re.sub(r'^[\w_][\w\d_\s]*\s*=\s*', '', sql, count=1)
 
         # Replace DAX brackets with SQL quotes
         sql = sql.replace('[', '"').replace(']', '"')
 
         # DAX functions to SQL equivalents
         replacements = {
-            'DIVIDE(': 'COALESCE(',  # Basic DIVIDE support
             'AVERAGE(': 'AVG(',
             'COUNT(': 'COUNT(',
             'COUNTROWS(': 'COUNT(*)',
@@ -206,20 +213,32 @@ class DAXExecutor:
             'MAX(': 'MAX(',
             'SUM(': 'SUM(',
         }
-
         for dax_func, sql_func in replacements.items():
             sql = sql.replace(dax_func, sql_func)
 
-        # Handle DIVIDE safety (add NULLIF)
-        # DIVIDE(SUM([Sales]), SUM([Quantity])) -> SUM("Sales") / NULLIF(SUM("Quantity"), 0)
-        if 'COALESCE' in sql:
-            # Basic pattern matching for DIVIDE
-            sql = sql.replace('COALESCE(', '')
-            parts = sql.split(',')
-            if len(parts) == 2:
-                numerator = parts[0].strip()
-                denominator = parts[1].replace(')', '').strip()
-                sql = f"{numerator} / NULLIF({denominator}, 0)"
+        # Handle DIVIDE(numerator, denominator, alternate)
+        # Convert to: numerator / NULLIF(denominator, 0)
+        def replace_divide(m):
+            inner = m.group(1)
+            # Split on top-level comma
+            depth = 0
+            parts = []
+            cur = []
+            for ch in inner:
+                if ch == '(' : depth += 1
+                elif ch == ')': depth -= 1
+                if ch == ',' and depth == 0:
+                    parts.append(''.join(cur).strip())
+                    cur = []
+                else:
+                    cur.append(ch)
+            if cur:
+                parts.append(''.join(cur).strip())
+            if len(parts) >= 2:
+                return f"{parts[0]} / NULLIF({parts[1]}, 0)"
+            return m.group(0)
+
+        sql = re.sub(r'\bDIVIDE\s*\((.+)\)', replace_divide, sql, flags=re.IGNORECASE | re.DOTALL)
 
         return sql
 

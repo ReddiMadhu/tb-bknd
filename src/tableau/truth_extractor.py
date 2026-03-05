@@ -43,6 +43,9 @@ class TruthMapExtractor:
             use_hyper: Use Hyper API if available, otherwise DuckDB
         """
         self.use_hyper = use_hyper and HYPER_AVAILABLE
+        # Cache: hyper_path → {raw_table_name: set(lowercase_col_names)}
+        # Built once per hyper file, reused for all formula scorings
+        self._table_cols_cache: Dict[str, Dict[str, set]] = {}
         logger.info(f"Truth Map Extractor initialized (Hyper: {self.use_hyper})")
 
     # ============================================
@@ -104,24 +107,57 @@ class TruthMapExtractor:
         filters: Optional[List[str]],
         limit: int
     ) -> Dict[str, TruthSlice]:
-        """Extract using Tableau Hyper API"""
+        """Extract using Tableau Hyper API with auto table-detection."""
         if not HYPER_AVAILABLE:
             raise Exception("tableauhyperapi not installed - use DuckDB fallback")
 
-        # Convert Tableau formula to SQL
+        # Convert Tableau formula to SQL (strips (TableName) qualifiers automatically)
         sql_calculation = self._tableau_to_sql(calculation)
 
-        # Build SQL query
-        query = self._build_sql_query(table_name, sql_calculation, dimensions, filters, limit)
+        # Auto-detect the best-matching Hyper table for this formula's columns
+        best_table = self._find_best_table(hyper_path, sql_calculation)
+        resolved_table = best_table if best_table else table_name
+        if resolved_table != table_name:
+            logger.info(f"Auto-selected table: {resolved_table} (requested: {table_name})")
+
+        # ── Calculated-field guard ────────────────────────────────────────────
+        # Some formulas reference OTHER calculated fields (e.g. Calculation_175…)
+        # that are computed by Tableau at runtime and never stored in any Hyper
+        # table. Querying for them always fails. Detect this early and skip.
+        #
+        # Two signals mark a reference as a calculated field, not a raw column:
+        #   1. Name matches Tableau's internal pattern  Calculation_\d+
+        #   2. Name is not present in ANY table's physical column set (cache)
+        all_cols_in_file: set = set()
+        for cols in self._table_cols_cache.get(hyper_path, {}).values():
+            all_cols_in_file |= cols
+
+        quoted_refs = set(re.findall(r'"([^"]+)"', sql_calculation))
+        calc_pattern = re.compile(r'^Calculation_\d+$')
+        phantom_cols = {
+            c for c in quoted_refs
+            if calc_pattern.match(c)                    # Tableau internal name
+            or (len(c) > 3 and c.lower() not in all_cols_in_file
+                and not c[0].islower())                  # upper-case but not in any table
+        }
+
+        if phantom_cols:
+            logger.warning(
+                f"⚠️  Skipping truth extraction — formula references intermediate "
+                f"calculated fields not stored in raw data: {phantom_cols}"
+            )
+            return {}
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Build SQL query against the resolved table
+        query = self._build_sql_query(resolved_table, sql_calculation, dimensions, filters, limit)
 
         truth_map = {}
 
         try:
-            # Handle different Hyper API versions
             try:
                 telemetry = Telemetry.DO_NOT_SEND_USAGE_DATA
             except AttributeError:
-                # Older version uses different enum value
                 telemetry = Telemetry.SEND_USAGE_DATA_TO_TABLEAU
 
             with HyperProcess(telemetry=telemetry) as hyper:
@@ -129,13 +165,9 @@ class TruthMapExtractor:
                     result = connection.execute_list_query(query)
 
                     for row in result:
-                        # Last column is the calculated value
                         dim_values = {dimensions[i]: row[i] for i in range(len(dimensions))}
                         truth_value = float(row[-1]) if row[-1] is not None else None
-
-                        # Create composite key
                         slice_key = self._make_slice_key(dim_values)
-
                         truth_map[slice_key] = TruthSlice(
                             dimensions=dim_values,
                             truth_value=truth_value,
@@ -149,8 +181,9 @@ class TruthMapExtractor:
             logger.error(f"Hyper extraction failed: {e}")
             logger.info("Falling back to DuckDB...")
             return self._extract_from_duckdb(
-                hyper_path, table_name, calculation, dimensions, filters, limit
+                hyper_path, resolved_table, calculation, dimensions, filters, limit
             )
+
 
     # ============================================
     # DuckDB Fallback Implementation
@@ -165,34 +198,46 @@ class TruthMapExtractor:
         filters: Optional[List[str]],
         limit: int
     ) -> Dict[str, TruthSlice]:
-        """Extract using DuckDB (works with .hyper, .parquet, .csv)"""
+        """Extract using DuckDB — for Hyper files loads data via HyperDataProfiler."""
 
-        # Convert Tableau formula to SQL
         sql_calculation = self._tableau_to_sql(calculation)
-
-        # Build SQL query
-        query = self._build_sql_query(table_name, sql_calculation, dimensions, filters, limit)
-
         truth_map = {}
 
         try:
             con = duckdb.connect(database=':memory:')
 
-            # DuckDB can read Hyper files directly!
             if data_source.endswith('.hyper'):
-                # Install and load spatial extension for Hyper support
-                con.execute("INSTALL spatial;")
-                con.execute("LOAD spatial;")
+                # For Hyper files, load the matching table into DuckDB as "data"
+                # (DuckDB cannot query Hyper schema-qualified names directly)
+                try:
+                    from src.tableau.hyper_profiler import HyperDataProfiler
+                    profiler = HyperDataProfiler(data_source)
+                    # Resolve best table (same logic as Hyper path)
+                    best_raw = table_name if table_name else profiler.list_tables()[0]
+                    unquoted = best_raw.replace('"', '').replace("'", '')
+                    df = profiler.read_table(unquoted)
+                    con.execute("CREATE TABLE data AS SELECT * FROM df")
+                    # Query from "data" (DuckDB in-memory table)
+                    query = self._build_sql_query('data', sql_calculation, dimensions, filters, limit)
+                    logger.info(f"DuckDB fallback: loaded {len(df)} rows from '{unquoted}'")
+                except Exception as load_err:
+                    logger.error(f"DuckDB Hyper load failed: {load_err}")
+                    return {}
+            elif data_source.endswith('.parquet'):
+                con.execute(f"CREATE TABLE data AS SELECT * FROM '{data_source}'")
+                query = self._build_sql_query('data', sql_calculation, dimensions, filters, limit)
+            elif data_source.endswith('.csv'):
+                con.execute(f"CREATE TABLE data AS SELECT * FROM read_csv_auto('{data_source}')")
+                query = self._build_sql_query('data', sql_calculation, dimensions, filters, limit)
+            else:
+                query = self._build_sql_query(table_name, sql_calculation, dimensions, filters, limit)
 
-            # Execute query
             result = con.execute(query).fetchall()
 
             for row in result:
                 dim_values = {dimensions[i]: row[i] for i in range(len(dimensions))}
                 truth_value = float(row[-1]) if row[-1] is not None else None
-
                 slice_key = self._make_slice_key(dim_values)
-
                 truth_map[slice_key] = TruthSlice(
                     dimensions=dim_values,
                     truth_value=truth_value,
@@ -301,6 +346,7 @@ class TruthMapExtractor:
         - IF-THEN-ELSE → CASE WHEN
         - [Field] → "Field"
         - Basic aggregations (SUM, AVG, etc.)
+        - Strips Tableau (TableName) qualifiers: "col (Invoice)" → "col"
 
         Args:
             tableau_formula: Tableau calculation syntax
@@ -314,17 +360,20 @@ class TruthMapExtractor:
         # Do this FIRST before IF conversion
         sql = re.sub(r'\[([^\]]+)\]', r'"\1"', sql)
 
-        # Pattern 2: IF-THEN-ELSE → CASE WHEN
-        # Handle nested quotes and complex conditions
-        # IF condition THEN value ELSE value END
-        # Note: Use non-greedy matching and handle the full IF structure
+        # Pattern 2: Strip Tableau table-qualifier suffixes from column references
+        # Tableau uses "column (TableName)" to disambiguate cross-source fields,
+        # but Hyper stores only the bare column name. Strip the " (TableName)" part.
+        # e.g. "income_class (Invoice)" → "income_class"
+        #      "Amount (Fees)"         → "Amount"
+        sql = re.sub(r'"([^"]+)\s+\([^)]+\)"', r'"\1"', sql)
+
+        # Pattern 3: IF-THEN-ELSE → CASE WHEN
         def convert_if_to_case(match):
             condition = match.group(1).strip()
             then_value = match.group(2).strip()
             else_value = match.group(3).strip() if match.group(3) else 'NULL'
             return f'CASE WHEN {condition} THEN {then_value} ELSE {else_value} END'
 
-        # Match IF...THEN...ELSE...END with flexible whitespace (\s* = zero or more)
         sql = re.sub(
             r'\bIF\s+(.+?)\s*THEN\s*(.+?)(?:\s*ELSE\s*(.+?))?\s*END\b',
             convert_if_to_case,
@@ -332,11 +381,82 @@ class TruthMapExtractor:
             flags=re.IGNORECASE | re.DOTALL
         )
 
-        # Pattern 3: Aggregation functions - these work the same in Tableau and SQL
+        # Pattern 4: Aggregation functions — work the same in Tableau and SQL
         # SUM([Sales]) is already converted to SUM("Sales") by pattern 1
 
         logger.info(f"🔄 Converted Tableau formula to SQL:\n  IN:  {tableau_formula}\n  OUT: {sql}")
         return sql
+
+    # ============================================
+    # Table Auto-Detection
+    # ============================================
+
+    def _find_best_table(
+        self,
+        hyper_path: str,
+        sql_calculation: str
+    ) -> Optional[str]:
+        """
+        Scan all tables in a Hyper file and return the raw table name whose
+        columns best match the column references in sql_calculation.
+
+        Uses read_table(limit=1) to get column names — cached per hyper_path
+        so column maps are built once and reused across all 21+ formula scorings.
+        """
+        try:
+            from src.tableau.hyper_profiler import HyperDataProfiler
+            profiler = HyperDataProfiler(hyper_path)
+            all_tables = profiler.list_tables()
+
+            if not all_tables:
+                return None
+
+            # Build column map for this hyper file once, then cache it
+            if hyper_path not in self._table_cols_cache:
+                cache: Dict[str, set] = {}
+                for raw_table in all_tables:
+                    try:
+                        unquoted = raw_table.replace('"', '').replace("'", '')
+                        df = profiler.read_table(unquoted, limit=1)
+                        cache[raw_table] = {c.lower() for c in df.columns}
+                    except Exception as e:
+                        logger.debug(f"Cache build failed for {raw_table}: {e}")
+                        cache[raw_table] = set()
+                self._table_cols_cache[hyper_path] = cache
+                logger.debug(f"Built column cache for {len(cache)} tables in {hyper_path}")
+
+            table_cols_map = self._table_cols_cache[hyper_path]
+
+            # Extract double-quoted identifiers from the SQL formula
+            col_refs = set(re.findall(r'"([^"]+)"', sql_calculation))
+            # Filter out string literals; keep actual column-like names
+            col_refs = {
+                c for c in col_refs
+                if len(c) > 3 and (
+                    "_" in c
+                    or any(ch.isupper() for ch in c)
+                    or len(c) > 10
+                )
+            }
+
+            # Score each table: count how many formula columns it contains
+            best_table = None
+            best_score = -1
+            for raw_table, cols in table_cols_map.items():
+                score = sum(1 for c in col_refs if c.lower() in cols)
+                if score > best_score:
+                    best_score = score
+                    best_table = raw_table
+
+            if best_table and best_score > 0:
+                return best_table
+
+            return all_tables[0]  # Fallback to first table
+
+        except Exception as e:
+            logger.debug(f"Table auto-detection failed: {e}")
+            return None
+
 
     def save_truth_map(self, truth_map: Dict[str, TruthSlice], output_path: str):
         """Save truth map to JSON file for debugging"""

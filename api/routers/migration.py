@@ -74,14 +74,21 @@ async def upload_twbx_files(
         migration = migration_store.create_migration(migration_id)
 
         # Save uploaded files
+        MAX_FILE_SIZE = 500 * 1024 * 1024  # S3 fix: 500MB limit
         file_paths = []
         for file in files:
             # Save file
             file_id = f"file_{uuid.uuid4().hex[:8]}"
             stored_path = Path(config.UPLOAD_DIR) / f"{migration_id}_{file.filename}"
 
+            content = await file.read()
+            if len(content) > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File {file.filename} exceeds 500MB limit ({len(content) / 1e6:.0f}MB)"
+                )
+
             with open(stored_path, "wb") as f:
-                content = await file.read()
                 f.write(content)
 
             file_paths.append(str(stored_path))
