@@ -200,8 +200,10 @@ class HyperDataProfiler:
                 query = f'SELECT * FROM "{schema}"."{table}" LIMIT {limit}'
 
                 with connection.execute_query(query) as result:
-                    # Get column names
-                    columns = [col.name for col in result.schema.columns]
+                    # Get column names as plain Python strings.
+                    # str(Name('income_class')) returns '"income_class"' (with embedded quotes).
+                    # Strip those surrounding quotes to get the bare column name.
+                    columns = [str(col.name).strip('"') for col in result.schema.columns]
 
                     # Fetch all rows
                     rows = []

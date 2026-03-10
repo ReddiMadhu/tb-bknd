@@ -128,18 +128,12 @@ class TruthMapExtractor:
         # Two signals mark a reference as a calculated field, not a raw column:
         #   1. Name matches Tableau's internal pattern  Calculation_\d+
         #   2. Name is not present in ANY table's physical column set (cache)
-        all_cols_in_file: set = set()
-        for cols in self._table_cols_cache.get(hyper_path, {}).values():
-            all_cols_in_file |= cols
-
+        # Only block Tableau's auto-named internal calc fields (Calculation_\d+)
+        # Do NOT use the all_cols_in_file check — it would wrongly block real columns
+        # like "Amount", "Cross sell bugdet" etc. if the cache wasn't warm yet.
         quoted_refs = set(re.findall(r'"([^"]+)"', sql_calculation))
         calc_pattern = re.compile(r'^Calculation_\d+$')
-        phantom_cols = {
-            c for c in quoted_refs
-            if calc_pattern.match(c)                    # Tableau internal name
-            or (len(c) > 3 and c.lower() not in all_cols_in_file
-                and not c[0].islower())                  # upper-case but not in any table
-        }
+        phantom_cols = {c for c in quoted_refs if calc_pattern.match(c)}
 
         if phantom_cols:
             logger.warning(
@@ -340,52 +334,170 @@ class TruthMapExtractor:
 
     def _tableau_to_sql(self, tableau_formula: str) -> str:
         """
-        Convert Tableau calculation syntax to SQL
+        Convert Tableau calculation syntax to SQL.
 
-        Handles common patterns:
-        - IF-THEN-ELSE → CASE WHEN
-        - [Field] → "Field"
-        - Basic aggregations (SUM, AVG, etc.)
-        - Strips Tableau (TableName) qualifiers: "col (Invoice)" → "col"
-
-        Args:
-            tableau_formula: Tableau calculation syntax
-
-        Returns:
-            SQL-compatible expression
+        Handles:
+        - [Field Name]         → "Field Name"
+        - "col (TableName)"    → "col"        (strip cross-source qualifier)
+        - IF/ELSEIF/ELSE/END   → CASE WHEN
+        - IIF(c, t, f)         → CASE WHEN c THEN t ELSE f END
+        - AND / OR (keyword)   → AND / OR (already SQL)
+        - ISNULL(x) / IFNULL   → x IS NULL / COALESCE
+        - ZN(x)                → COALESCE(x, 0)
+        - CONTAINS(x, y)       → x LIKE '%y%'
+        - COUNTD(x)            → COUNT(DISTINCT x)
+        - ATTR(x)              → MIN(x)
+        - DATEPART / DATEDIFF  → EXTRACT / date math stubs
+        - Single-quote strings → keep as-is (SQL standard)
         """
         sql = tableau_formula.strip()
 
-        # Pattern 1: Field references [Field Name] → "Field Name"
-        # Do this FIRST before IF conversion
+        # ── 1. [Field Name] → "Field Name" ──────────────────────────────────
         sql = re.sub(r'\[([^\]]+)\]', r'"\1"', sql)
 
-        # Pattern 2: Strip Tableau table-qualifier suffixes from column references
-        # Tableau uses "column (TableName)" to disambiguate cross-source fields,
-        # but Hyper stores only the bare column name. Strip the " (TableName)" part.
-        # e.g. "income_class (Invoice)" → "income_class"
-        #      "Amount (Fees)"         → "Amount"
+        # ── 2. Strip (TableName) cross-source qualifiers FIRST ───────────────
+        #     "income_class (Invoice)" → "income_class"
+        #     "Amount (Fees)"          → "Amount"
+        # MUST run before string-literal detection so that column refs with
+        # spaces from table qualifiers won't be misidentified as string literals.
         sql = re.sub(r'"([^"]+)\s+\([^)]+\)"', r'"\1"', sql)
 
-        # Pattern 3: IF-THEN-ELSE → CASE WHEN
-        def convert_if_to_case(match):
-            condition = match.group(1).strip()
-            then_value = match.group(2).strip()
-            else_value = match.group(3).strip() if match.group(3) else 'NULL'
-            return f'CASE WHEN {condition} THEN {then_value} ELSE {else_value} END'
+        # ── 1b. Tableau string literals in double quotes → SQL single quotes ─
+        # Tableau string comparisons are Case-Insensitive. SQL is Case-Sensitive.
+        # [income_class]="cross sell" vs "Cross Sell" in DB data.
+        # We will wrap identifiers in LOWER() and lower case the string literal
+        # if accompanied by an = or <> or != operator.
+        
+        def _fix_string_literal(m):
+            op = m.group(1).strip()
+            content = m.group(2)
+            
+            # Is it a string literal? (has space or special chars)
+            is_literal = False 
+            if ' ' in content or not re.match(r'^[\w]+$', content):
+                is_literal = True
+                
+            if is_literal:
+                quote = "'"
+                val = content.lower() # Lowercase the literal for comparison
+            else:
+                quote = '"'
+                val = content
+                
+            return f" {op} {quote}{val}{quote}"
 
+        # Apply to double-quoted tokens that follow =, <>, !=
+        # This regex now captures the operator (group 1) and the token (group 2)
         sql = re.sub(
-            r'\bIF\s+(.+?)\s*THEN\s*(.+?)(?:\s*ELSE\s*(.+?))?\s*END\b',
-            convert_if_to_case,
-            sql,
-            flags=re.IGNORECASE | re.DOTALL
+            r'([=!<>]+)\s*"([^"]+)"',
+            _fix_string_literal,
+            sql
+        )
+        
+        # Now find any identifier immediately before an operator and wrap in LOWER
+        # e.g., "income_class"='cross sell' → LOWER("income_class")='cross sell'
+        # We do this for string literals only (which now have single quotes)
+        sql = re.sub(
+            r'"([^"]+)"\s*([=!<>]+)\s*\'([^\']+)\'',
+            r"""LOWER("\1")\2'\3'""",
+            sql
         )
 
-        # Pattern 4: Aggregation functions — work the same in Tableau and SQL
-        # SUM([Sales]) is already converted to SUM("Sales") by pattern 1
+        # Handle THEN "value" and ELSE "value" where value has spaces (string literals)
+        sql = re.sub(
+            r'\b(THEN|ELSE)\s+"([^"]+)"',
+            lambda m: f"{m.group(1)} '{m.group(2)}'" if ' ' in m.group(2) else f'{m.group(1)} "{m.group(2)}"',
+            sql, flags=re.IGNORECASE
+        )
 
-        logger.info(f"🔄 Converted Tableau formula to SQL:\n  IN:  {tableau_formula}\n  OUT: {sql}")
+
+
+        # ── 3. IIF(condition, true_val, false_val) → CASE WHEN … END ─────────
+        def _expand_iif(m):
+            cond = m.group(1).strip()
+            tv   = m.group(2).strip()
+            fv   = m.group(3).strip()
+            return f"CASE WHEN {cond} THEN {tv} ELSE {fv} END"
+
+        sql = re.sub(
+            r'\bIIF\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*\)',
+            _expand_iif, sql, flags=re.IGNORECASE
+        )
+
+        # ── 4. IF [ELSEIF]* ELSE END → CASE WHEN … END ─────────────────────
+        def _expand_if(m):
+            body = m.group(1)
+            # Split on ELSEIF / ELSE
+            parts = re.split(r'\bELSEIF\b', body, flags=re.IGNORECASE)
+            chunks = []
+            for i, part in enumerate(parts):
+                # Each part: "condition THEN value"
+                then_split = re.split(r'\bTHEN\b', part, maxsplit=1, flags=re.IGNORECASE)
+                if len(then_split) == 2:
+                    cond, val = then_split
+                    # val may contain ELSE
+                    else_split = re.split(r'\bELSE\b', val, maxsplit=1, flags=re.IGNORECASE)
+                    if len(else_split) == 2 and i == len(parts) - 1:
+                        chunks.append(f"WHEN {cond.strip()} THEN {else_split[0].strip()}")
+                        chunks.append(f"ELSE {else_split[1].strip()}")
+                    else:
+                        chunks.append(f"WHEN {cond.strip()} THEN {val.strip()}")
+                else:
+                    # Bare ELSE clause (first part only had condition)
+                    chunks.append(f"ELSE {part.strip()}")
+            return "CASE " + " ".join(chunks) + " END"
+
+        sql = re.sub(
+            r'\bIF\s+(.+?)\s+END\b',
+            _expand_if, sql, flags=re.IGNORECASE | re.DOTALL
+        )
+
+        # ── 5. Aggregations ──────────────────────────────────────────────────
+        sql = re.sub(r'\bCOUNTD\s*\(', 'COUNT(DISTINCT ', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bATTR\s*\(',   'MIN(',            sql, flags=re.IGNORECASE)
+
+        # ── 6. Null helpers ──────────────────────────────────────────────────
+        # ZN(x) → COALESCE(x, 0)
+        sql = re.sub(r'\bZN\s*\((.+?)\)', r'COALESCE(\1, 0)', sql, flags=re.IGNORECASE)
+        # ISNULL(x) → x IS NULL
+        sql = re.sub(r'\bISNULL\s*\((.+?)\)', r'(\1 IS NULL)', sql, flags=re.IGNORECASE)
+        # IFNULL(x, y) → COALESCE(x, y)
+        sql = re.sub(r'\bIFNULL\s*\(', 'COALESCE(', sql, flags=re.IGNORECASE)
+
+        # ── 7. String helpers ────────────────────────────────────────────────
+        # CONTAINS("col", "val") → "col" LIKE '%val%'
+        def _expand_contains(m):
+            field = m.group(1).strip()
+            needle = m.group(2).strip().strip("'\"")
+            return f"{field} LIKE '%{needle}%'"
+
+        sql = re.sub(
+            r'\bCONTAINS\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
+            _expand_contains, sql, flags=re.IGNORECASE
+        )
+
+        # ── 8. Date functions (stub — exact flavour depends on Hyper/DuckDB) ─
+        # DATEPART('year', [Date]) → EXTRACT(YEAR FROM "Date")
+        def _expand_datepart(m):
+            part  = m.group(1).strip().strip("'\"").upper()
+            field = m.group(2).strip()
+            return f"EXTRACT({part} FROM {field})"
+
+        sql = re.sub(
+            r'\bDATEPART\s*\(\s*([^,]+)\s*,\s*(.+?)\s*\)',
+            _expand_datepart, sql, flags=re.IGNORECASE
+        )
+
+        # DATEDIFF('day', start, end) → DATEDIFF('day', start, end)  ← pass-through for Hyper
+        # (Hyper supports DATEDIFF natively, DuckDB uses age/epoch arithmetic; leave for now)
+
+        # ── 9. Boolean operator normalisation ───────────────────────────────
+        # Tableau uses AND / OR as keywords — same as SQL, nothing to do.
+        # But Tableau also uses != which is already SQL. Leave as-is.
+
+        logger.info(f"🔄 Tableau→SQL:\n  IN:  {tableau_formula}\n  OUT: {sql}")
         return sql
+
 
     # ============================================
     # Table Auto-Detection
@@ -418,25 +530,31 @@ class TruthMapExtractor:
                     try:
                         unquoted = raw_table.replace('"', '').replace("'", '')
                         df = profiler.read_table(unquoted, limit=1)
-                        cache[raw_table] = {c.lower() for c in df.columns}
+                        # tableauhyperapi returns Name objects, not strings
+                        # Use str() to safely convert before calling .lower()
+                        cache[raw_table] = {str(c).lower() for c in df.columns}
                     except Exception as e:
                         logger.debug(f"Cache build failed for {raw_table}: {e}")
                         cache[raw_table] = set()
                 self._table_cols_cache[hyper_path] = cache
-                logger.debug(f"Built column cache for {len(cache)} tables in {hyper_path}")
+                cols_per_table = {t: len(c) for t, c in cache.items()}
+                logger.debug(f"Built column cache for {len(cache)} tables: {cols_per_table}")
 
             table_cols_map = self._table_cols_cache[hyper_path]
 
             # Extract double-quoted identifiers from the SQL formula
-            col_refs = set(re.findall(r'"([^"]+)"', sql_calculation))
-            # Filter out string literals; keep actual column-like names
+            # Exclude: (1) Calculation_\d+ internal fields, (2) string literal values
+            calc_pattern_re = re.compile(r'^Calculation_\d+$')
+            all_col_refs = set(re.findall(r'"([^"]+)"', sql_calculation))
             col_refs = {
-                c for c in col_refs
-                if len(c) > 3 and (
-                    "_" in c
-                    or any(ch.isupper() for ch in c)
-                    or len(c) > 10
-                )
+                c for c in all_col_refs
+                if not calc_pattern_re.match(c)   # not a Tableau internal calc name
+                and len(c) > 1                     # not a single char
+                and ' ' not in c                   # not a string literal with spaces (e.g. "cross sell")
+                and c.lower() not in {             # not common SQL-string values
+                    'open', 'closed', 'true', 'false', 'null', 'yes', 'no'
+                }
+                and not c[0].isdigit()             # not a number
             }
 
             # Score each table: count how many formula columns it contains

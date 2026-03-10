@@ -271,16 +271,9 @@ class ValidationEngine:
         )
 
     def _tableau_to_sql(self, tableau_formula: str) -> str:
-        """Convert Tableau formula to SQL for truth extraction (C1 fix)."""
-        # Replace Tableau brackets with SQL double-quotes
-        sql = tableau_formula.replace('[', '"').replace(']', '"')
-
-        # C1 fix: actual Tableau→SQL function mappings
-        sql = re.sub(r'\bATTR\(', 'MIN(', sql)  # ATTR → MIN (closest SQL equiv)
-        sql = re.sub(r'\bCOUNTD\(', 'COUNT(DISTINCT ', sql)
-        sql = re.sub(r'\bZN\(', 'COALESCE(', sql)  # ZN(x) → COALESCE(x, 0)
-        # Fix ZN closing: add , 0 before the closing paren
-        return sql
+        """Convert Tableau formula to SQL — delegates to the canonical implementation
+        in TruthMapExtractor so both paths use identical conversion logic."""
+        return self.truth_extractor._tableau_to_sql(tableau_formula)
 
     def _manual_review_result(self, conversion_id: str, dax_formula: str, reason: str) -> ValidationResult:
         """Helper to create a manual-review ValidationResult."""
