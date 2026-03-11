@@ -893,31 +893,31 @@ async def export_powerbi_artifacts(migration_id: str):
                     zipf.write(excel_file, f"table_data/{excel_file.name}")
 
             # ---------------------------------------------------------
-            # Include Existing PBIP File
+            # Include Generated PBIP Project (native TMDL structure)
             # ---------------------------------------------------------
-            # Path to your actual .pbip file in the backend
-            pbip_source_file = Path("template.pbip")
-            
-            if pbip_source_file.exists():
-                # Write the single file directly into the root of the ZIP
-                zipf.write(pbip_source_file, "migration_project.pbip")
+            pbip_dir = Path("exports") / migration_id / "pbip_output"
+
+            if pbip_dir.exists():
+                pbip_file_count = 0
+                for fp in pbip_dir.rglob("*"):
+                    if fp.is_file():
+                        # Preserve the inner folder structure under pbip_project/
+                        arcname = f"pbip_project/{fp.relative_to(pbip_dir)}"
+                        zipf.write(fp, arcname)
+                        pbip_file_count += 1
+                logger.info(f"Zipped PBIP project: {pbip_file_count} files from {pbip_dir}")
             else:
-                logger.warning(f"PBIP source file not found at: {pbip_source_file}")
-                # Fallback to dummy if the file doesn't exist yet
-                dummy_pbip_content = json.dumps({
-                    "version": "1.0",
-                    "artifacts": [
-                        {
-                            "report": {
-                                "path": "Report"
-                            }
-                        }
-                    ],
-                    "settings": {
-                        "enableAutoRecovery": True
-                    }
-                }, indent=2)
-                zipf.writestr("migration_project.pbip", dummy_pbip_content)
+                # PBIP generation was skipped or failed — include a minimal stub
+                logger.warning(f"PBIP output folder not found at {pbip_dir} — including stub")
+                zipf.writestr(
+                    "pbip_project/migration.pbip",
+                    json.dumps({
+                        "version": "1.0",
+                        "artifacts": [],
+                        "settings": {"enableAutoRecovery": True},
+                        "_note": "PBIP generation was not completed for this migration"
+                    }, indent=2)
+                )
 
         logger.info(f"Generated artifacts ZIP for {migration_id} at {artifact_path}")
         

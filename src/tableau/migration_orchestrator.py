@@ -849,32 +849,30 @@ class MigrationOrchestrator:
             logger.error(f"❌ Failed to convert filters: {e}", exc_info=True)
             filter_param_results = {"filters": [], "whatif_parameters": [], "slicer_tables": []}
 
-        # Step 3: Generate PBIP project - DISABLED as per request
-        # self._update_progress(
-        #     migration_id,
-        #     MigrationStatus.VALIDATING,
-        #     84,
-        #     "Generating Power BI Project (PBIP)...",
-        #     progress_callback
-        # )
+        # Step 3: Generate PBIP project
+        self._update_progress(
+            migration_id,
+            MigrationStatus.VALIDATING,
+            84,
+            "Generating Power BI Project (PBIP)...",
+            progress_callback
+        )
 
-        # logger.info("Step 3/5: Generating PBIP project structure...")
-        # try:
-        #     pbip_path = self._generate_pbip_project(
-        #         migration_id,
-        #         conversions,
-        #         relationships,
-        #         filter_param_results,
-        #         workbooks_data,
-        #         progress_callback
-        #     )
-        #     if pbip_path:
-        #         logger.info(f"✅ PBIP project created: {pbip_path}")
-        #     else:
-        #         logger.warning("⚠️  PBIP generation failed")
-        # except Exception as e:
-        #     logger.error(f"❌ Failed to generate PBIP: {e}", exc_info=True)
-        pbip_path = None
+        logger.info("Step 3/5: Generating PBIP project structure...")
+        try:
+            pbip_path = self._generate_pbip_project(
+                migration_id=migration_id,
+                conversions=conversions,
+                workbooks_data=workbooks_data,
+                progress_callback=progress_callback
+            )
+            if pbip_path:
+                logger.info(f"✅ PBIP project created: {pbip_path}")
+            else:
+                logger.warning("⚠️  PBIP generation failed")
+        except Exception as e:
+            logger.error(f"❌ Failed to generate PBIP: {e}", exc_info=True)
+            pbip_path = None
 
         # Step 4: Export table data to Excel
         self._update_progress(
@@ -1005,130 +1003,143 @@ class MigrationOrchestrator:
         }
 
     # ============================================
-    # Phase 8: Create & Inject PBIX (NEW)
+    # Phase 8: Generate PBIP via TMDL injection
     # ============================================
 
     def _generate_pbip_project(
         self,
         migration_id: str,
         conversions: List[Dict[str, Any]],
-        relationships: List[Relationship],
-        filter_param_results: Dict[str, Any],
         workbooks_data: List[Dict[str, Any]],
         progress_callback: Optional[ProgressCallback]
     ) -> Optional[Path]:
-        """Generate complete PBIP folder structure (replaces PBIX generation)"""
+        """
+        Generate a complete, openable Power BI Project (.pbip) by writing
+        native TMDL text files into a blank template copy.
 
-        logger.info("Phase 8: Generating PBIP project structure...")
+        Data sources (all already in memory — zero re-opens):
+        - conversions        : each dict has calc_name + dax_result.dax_formula
+        - self._hyper_profilers : cached open profilers from Phase 1
+        - workbooks_data     : each wb dict has hyper_files list
 
-        from src.tableau.powerbi_exporter import PowerBIExporter
+        Output layout
+        -------------
+        exports/{migration_id}/pbip_output/
+            template.pbip
+            template.SemanticModel/
+                definition/
+                    model.tmdl          ← blank header + injected ref table lines
+                    database.tmdl
+                    tables/
+                        <TableName>.tmdl   (one per Hyper table)
+                        MeasuresTable.tmdl (all DAX measures)
+            template.Report/
+                definition.pbir
+        """
+        import shutil
+        import pandas as pd
+        from src.powerbi.pbip_tmdl_injector import PBIPTmdlInjector
 
-        export_dir = Path("exports") / migration_id
-        export_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("📄 Generating PBIP project via TMDL injection...")
 
-        # Collect all measures from conversions
-        measures = []
+        # ── 1. Copy blank template → fresh output directory ─────────────────
+        template_dir = (
+            Path(__file__).resolve().parent.parent
+            / "powerbi" / "templates" / "blank_pbip"
+        )
+        if not template_dir.exists():
+            logger.error(f"❌ Blank PBIP template not found at: {template_dir}")
+            return None
 
+        output_dir = Path("exports") / migration_id / "pbip_output"
+        if output_dir.exists():
+            shutil.rmtree(output_dir)   # clean slate on re-run
+        shutil.copytree(template_dir, output_dir)
+        logger.info(f"  ✓ Template copied to: {output_dir}")
+
+        sm_folder = output_dir / "template.SemanticModel"
+
+        # ── 2. Collect DataFrames from already-cached Hyper profilers ────────
+        tables: Dict[str, pd.DataFrame] = {}
+        seen_raw: set = set()
+
+        for wb in workbooks_data:
+            for hyper_path in wb.get("hyper_files", []):
+                profiler = self._hyper_profilers.get(str(hyper_path))
+                if not profiler:
+                    logger.warning(f"  ⚠ No cached profiler for {hyper_path} — skipping")
+                    continue
+
+                try:
+                    raw_tables = profiler.list_tables()
+                except Exception as e:
+                    logger.warning(f"  ⚠ Could not list tables in {hyper_path}: {e}")
+                    continue
+
+                for raw_table in raw_tables:
+                    if raw_table in seen_raw:
+                        continue
+                    seen_raw.add(raw_table)
+
+                    clean_name = profiler.get_clean_table_name(raw_table)
+
+                    try:
+                        unquoted = raw_table.replace('"', '')
+                        df = profiler.read_table(unquoted)
+                        tables[clean_name] = df if df is not None else pd.DataFrame()
+                        logger.info(
+                            f"  ✓ Loaded table '{clean_name}' "
+                            f"({len(tables[clean_name])} rows, "
+                            f"{len(tables[clean_name].columns)} cols)"
+                        )
+                    except Exception as e:
+                        logger.warning(f"  ⚠ Could not read '{raw_table}': {e} — using empty placeholder")
+                        tables[clean_name] = pd.DataFrame()  # still creates the table definition
+
+        logger.info(f"  ✓ {len(tables)} table(s) collected for PBIP")
+
+        # ── 3. Build measures list from validated conversions ─────────────────
+        measures: List[Dict[str, str]] = []
         for conv in conversions:
+            calc_name  = conv.get("calc_name", "").strip()
             dax_result = conv.get("dax_result")
 
-            if dax_result:
-                measure = Measure(
-                    name=conv.get("calc_name", "Measure"),
-                    expression=dax_result.dax_formula,
-                    display_folder="Migrated from Tableau",
-                    description=f"Converted from Tableau calculation"
-                )
-                measures.append(measure)
+            if not calc_name or not dax_result:
+                continue
 
-        logger.info(f"✓ Prepared {len(measures)} measures for PBIP")
+            dax_formula = getattr(dax_result, "dax_formula", None)
+            if not dax_formula or not dax_formula.strip():
+                logger.debug(f"  Skipping measure '{calc_name}' — empty DAX")
+                continue
+
+            measures.append({
+                "name":         calc_name,
+                "dax":          dax_formula,
+                "formatString": "0",
+            })
+
+        logger.info(f"  ✓ {len(measures)} measure(s) prepared for PBIP")
+
+        # ── 4. Inject TMDL files ──────────────────────────────────────────────
+        if not tables and not measures:
+            logger.warning("  ⚠ No tables or measures to inject — PBIP will be empty")
 
         try:
-            # Create PowerBIExporter instance
-            exporter = PowerBIExporter()
-
-            # Generate model.bim directly with measures we have
-            logger.info("Creating semantic model (model.bim)...")
-            model_bim_path = export_dir / "model.bim"
-
-            # Build model.bim content directly
-            import json
-
-            model = {
-                "name": f"TableauMigration_{migration_id}",
-                "compatibilityLevel": 1600,
-                "model": {
-                    "culture": "en-US",
-                    "tables": [
-                        {
-                            "name": "Calendar",
-                            "columns": [
-                                {"name": "Date", "dataType": "dateTime", "isKey": True},
-                                {"name": "Year", "dataType": "int64"},
-                                {"name": "Quarter", "dataType": "int64"},
-                                {"name": "Month", "dataType": "int64"},
-                                {"name": "Month Name", "dataType": "string"},
-                                {"name": "Day", "dataType": "int64"}
-                            ],
-                            "partitions": [
-                                {
-                                    "name": "Calendar",
-                                    "mode": "import",
-                                    "source": {
-                                        "type": "m",
-                                        "expression": "Calendar"
-                                    }
-                                }
-                            ]
-                        }
-                    ],
-                    "relationships": [],
-                    "measures": []
-                }
-            }
-
-            # Add measures from conversions
-            for measure in measures:
-                model["model"]["measures"].append({
-                    "name": measure.name,
-                    "expression": measure.expression,
-                    "formatString": "#,##0.00"
-                })
-
-            # Write model.bim
-            with open(model_bim_path, 'w', encoding='utf-8') as f:
-                json.dump(model, f, indent=2)
-
-            logger.info(f"✅ Created semantic model with {len(measures)} measures")
-
-            # Now create PBIP project structure around it
-            logger.info("Creating PBIP folder structure...")
-            artifacts = {
-                "semantic_model": str(model_bim_path)
-            }
-
-            pbip_path = exporter._create_pbip_project(
-                migration_id=migration_id,
-                export_path=export_dir,
-                artifacts=artifacts
+            injector = PBIPTmdlInjector()
+            injected = injector.inject(
+                sm_folder=sm_folder,
+                tables=tables,
+                measures=measures,
             )
-
-            if pbip_path and pbip_path.exists():
-                logger.info(f"✅ PBIP project created: {pbip_path}")
-                logger.info(f"   → {len(measures)} measures added")
-                logger.info(f"   → {len(relationships)} relationships defined")
-                logger.info(f"   → Complete folder structure generated")
-
-                return pbip_path
-            else:
-                logger.warning("⚠️  PBIP project creation failed")
-                return None
-
+            logger.info(
+                f"  ✅ PBIP injection complete: "
+                f"{len(injected)} table(s) written to {sm_folder / 'definition' / 'tables'}"
+            )
         except Exception as e:
-            logger.error(f"PBIP generation failed: {e}", exc_info=True)
-            import traceback
-            traceback.print_exc()
+            logger.error(f"  ❌ TMDL injection failed: {e}", exc_info=True)
             return None
+
+        return output_dir
 
     # R4+R2: Removed _export_dax_fallback (never called) and
     # _generate_migration_documentation (used removed VisualConverter).
