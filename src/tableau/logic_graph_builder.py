@@ -1,10 +1,31 @@
 """Logic Graph Builder - Construct dependency DAG from Tableau calculations"""
 import re
-from typing import List, Dict, Any, Set, Tuple
+from typing import List, Dict, Any, Set, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
 import networkx as nx
 from loguru import logger
+
+
+# Type Aliases
+Worksheet = Dict[str, Any]
+
+
+class VisualType(Enum):
+    """Tableau Mark/Visual types"""
+    BAR = "bar"
+    LINE = "line"
+    AREA = "area"
+    SQUARE = "square"
+    CIRCLE = "circle"
+    SHAPE = "shape"
+    TEXT = "text"
+    MAP = "map"
+    PIE = "pie"
+    GANTT = "gantt"
+    POLYGON = "polygon"
+    UNKNOWN = "Unknown"
+
 
 
 
@@ -489,6 +510,18 @@ class LogicGraphBuilder:
             all_fields = cleaned_rows + cleaned_cols + cleaned_marks
             ws_name = ws.get("name", "Unknown Sheet")
             visual_type = ws.get("mark_type", "Unknown")
+            # NEW: Add visual type (mapped to Enum)
+            mapped_visual_type = VisualType.UNKNOWN
+            try:
+                # Check if it's a valid enum value
+                vt_lower = str(visual_type).lower()
+                for vt in VisualType:
+                    if vt.value == vt_lower:
+                        mapped_visual_type = vt
+                        break
+            except Exception:
+                pass
+
 
             for field in all_fields:
                 if field in self.calculations:
@@ -499,8 +532,8 @@ class LogicGraphBuilder:
                         node.visual_context.used_in_worksheets.append(ws_name)
 
                     # NEW: Add visual type
-                    if visual_type not in node.visual_context.visual_types:
-                        node.visual_context.visual_types.append(visual_type)
+                    if mapped_visual_type not in node.visual_context.visual_types:
+                        node.visual_context.visual_types.append(mapped_visual_type)
 
                     # Determine partition (grouping) dimensions
                     partition_dims = [
