@@ -242,14 +242,15 @@ class MigrationStore:
             conn.execute(
                 """
                 INSERT INTO tableau_workbooks
-                (workbook_id, migration_id, filename, file_path, worksheet_count, dashboard_count, data_source_count, extracted_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (workbook_id, migration_id, filename, file_path, raw_model, worksheet_count, dashboard_count, data_source_count, extracted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     workbook.workbook_id,
                     workbook.migration_id,
                     workbook.filename,
                     workbook.file_path,
+                    json.dumps(workbook.raw_model) if workbook.raw_model else None,
                     workbook.worksheet_count,
                     workbook.dashboard_count,
                     workbook.data_source_count,
@@ -272,7 +273,7 @@ class MigrationStore:
         with get_db_connection() as conn:
             rows = conn.execute(
                 """
-                SELECT workbook_id, migration_id, filename, file_path,
+                SELECT workbook_id, migration_id, filename, file_path, raw_model,
                        worksheet_count, dashboard_count, data_source_count, extracted_at
                 FROM tableau_workbooks
                 WHERE migration_id = ?
@@ -294,9 +295,16 @@ class MigrationStore:
         Args:
             calculation: TableauCalculation object
         """
-        visual_context_json = (
-            json.dumps(calculation.visual_context) if calculation.visual_context else None
-        )
+        # Merge native fields into visual_context dict
+        visual_context_dict = calculation.visual_context or {}
+        visual_context_dict.update({
+            "is_lod": calculation.is_lod,
+            "is_table_calc": calculation.is_table_calc,
+            "used_in_tooltips": calculation.used_in_tooltips,
+            "used_in_filters": calculation.used_in_filters,
+        })
+        visual_context_json = json.dumps(visual_context_dict)
+        
         used_in_str = (
             ",".join(calculation.used_in_worksheets)
             if calculation.used_in_worksheets
@@ -361,7 +369,7 @@ class MigrationStore:
             rows = conn.execute(
                 """
                 SELECT calc_id, workbook_id, calc_name, calc_formula, calc_type,
-                       visual_context, used_in_worksheets, dependency_level, depends_on, depends_on_metadata, created_at
+                       visual_context, dependency_level, depends_on, depends_on_metadata, used_in_worksheets, created_at
                 FROM tableau_calculations
                 WHERE workbook_id = ?
                 ORDER BY dependency_level, calc_name
@@ -387,7 +395,7 @@ class MigrationStore:
             rows = conn.execute(
                 """
                 SELECT c.calc_id, c.workbook_id, c.calc_name, c.calc_formula, c.calc_type,
-                       c.visual_context, c.used_in_worksheets, c.dependency_level, c.depends_on, c.depends_on_metadata, c.created_at
+                       c.visual_context, c.dependency_level, c.depends_on, c.depends_on_metadata, c.used_in_worksheets, c.created_at
                 FROM tableau_calculations c
                 JOIN tableau_workbooks w ON c.workbook_id = w.workbook_id
                 WHERE w.migration_id = ?

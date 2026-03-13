@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from enum import Enum
 from loguru import logger
 
-from src.tableau.twb_parser import DataSource
 from src.powerbi.pbix_injector import Relationship, CalculatedColumn
 
 
@@ -60,7 +59,7 @@ class PowerBIModelBuilder:
 
     def build_relationships_from_tableau(
         self,
-        data_sources: List[DataSource],
+        data_sources: List[Dict[str, Any]],
         hyper_profiles: Optional[Dict[str, Any]] = None
     ) -> List[Relationship]:
         """
@@ -79,7 +78,7 @@ class PowerBIModelBuilder:
 
         for ds in data_sources:
             # Parse Tableau relationships
-            for rel_info in ds.relationships:
+            for rel_info in ds.get("relationships", []):
                 try:
                     # Extract join information from Tableau metadata
                     tableau_rel = self._parse_tableau_relationship(rel_info)

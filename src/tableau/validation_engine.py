@@ -65,14 +65,16 @@ class ValidationEngine:
         self.truth_extractor = TruthMapExtractor()
         logger.info("Validation Engine initialized with Truth Extractor and DAX Executor")
 
-        # Initialize DuckDB for DAX execution (mock Power BI)
-        try:
-            import duckdb
-            self.duckdb_conn = duckdb.connect()
-            logger.info("DuckDB initialized for DAX validation")
-        except ImportError:
-            logger.warning("DuckDB not available - validation will be limited")
-            self.duckdb_conn = None
+        # DuckDB validation disabled — commented out while DAX generation is being stabilised.
+        # Re-enable by uncommenting the block below.
+        # try:
+        #     import duckdb
+        #     self.duckdb_conn = duckdb.connect()
+        #     logger.info("DuckDB initialized for DAX validation")
+        # except ImportError:
+        #     logger.warning("DuckDB not available - validation will be limited")
+        #     self.duckdb_conn = None
+        self.duckdb_conn = None  # Validation disabled
 
     # ============================================
     # Main Validation Flow

@@ -6,7 +6,6 @@ from enum import Enum
 import networkx as nx
 from loguru import logger
 
-from src.tableau.twb_parser import CalculatedField, LODExpression, Worksheet, VisualType
 
 
 @dataclass
@@ -130,46 +129,65 @@ class LogicGraphBuilder:
 
     def build_graph(
         self,
-        calculated_fields: List[CalculatedField],
-        lod_expressions: List[LODExpression],
-        worksheets: List[Worksheet],
+        tableau_model: Dict[str, Any],
         base_field_metadata: Dict[str, Dict[str, Any]]
     ) -> nx.DiGraph:
         """
-        Build the dependency graph
+        Build the dependency graph directly from the parsed JSON model.
         
         Args:
-            calculated_fields: All calculated fields
-            lod_expressions: All LOD expressions
-            worksheets: All worksheets (for visual context)
+            tableau_model: The full dictionary model extracted from Tableau 
             base_field_metadata: Metadata for base fields (name -> {type, generic_type})
             
         Returns:
             NetworkX directed graph
         """
-        logger.info(f"Building logic graph from {len(calculated_fields)} calculations")
+        logger.info(f"Building logic graph from native Tableau JSON model")
         
         self.base_field_metadata = base_field_metadata
         self.base_fields = set(base_field_metadata.keys())
-        self.worksheets = worksheets
+        self.worksheets = tableau_model.get("worksheets", [])
         
         if not self.base_fields:
             logger.error(f"⚠️  CRITICAL: base_fields is EMPTY! All fields will be UNKNOWN!")
-            
+
+        # Extract only columns that have formulas
+        calculated_fields = [
+            col for col in tableau_model.get("columns", [])
+            if col.get("formula")
+        ]
+        
+        # Add table calcs that might be separate
+        for tc in tableau_model.get("table_calcs", []):
+            if tc.get("formula"):
+                calculated_fields.append({
+                    "caption": tc.get("caption", tc.get("name")),
+                    "formula": tc["formula"],
+                    "role": "measure"
+                })
+
         # Build role map from calculated fields
         for calc in calculated_fields:
-            self.field_roles[calc.name] = calc.role  # "measure" or "dimension"
+            name = calc.get("caption") or calc.get("internal_name") or calc.get("name")
+            self.field_roles[name] = calc.get("role", "measure")
 
         # Step 1: Create nodes for all calculations
         for calc in calculated_fields:
-            self._add_calculation_node(calc)
+            if calc.get("caption") or calc.get("internal_name") or calc.get("name"):
+                self._add_calculation_node(calc)
 
         # Step 2: Mark LOD expressions
-        for lod in lod_expressions:
-            if lod.name in self.calculations:
-                node = self.calculations[lod.name]
+        import re
+        for lod in tableau_model.get("lod_calcs", []):
+            name = lod.get("caption") or lod.get("internal_name") or lod.get("name")
+            if name and name in self.calculations:
+                node = self.calculations[name]
                 node.is_lod = True
-                node.lod_type = lod.lod_type
+                
+                formula = lod.get("formula", "")
+                match = re.search(r'\{(FIXED|INCLUDE|EXCLUDE)', formula, re.IGNORECASE)
+                node.lod_type = match.group(1).upper() if match else "FIXED"
+                
                 node.calc_type = CalculationType.LOD_EXPRESSION
 
         # Step 3: Extract dependencies and build edges with metadata
@@ -311,16 +329,20 @@ class LogicGraphBuilder:
                             logger.debug(f"  -> Updated dependency in '{succ_name}' to CALCULATED_MEASURE")
 
 
-    def _add_calculation_node(self, calc: CalculatedField):
+    def _add_calculation_node(self, calc: Dict[str, Any]):
         """Add a calculation node to the graph"""
         # Classify calculation type
         calc_type = self._classify_calculation_type(calc)
         granularity = self._detect_granularity(calc)
 
+        name = calc.get("caption") or calc.get("internal_name") or calc.get("name")
+        formula = calc.get("formula", "")
+        role = calc.get("role", "measure")
+
         node = CalculationNode(
-            calc_id=calc.name,
-            name=calc.name,
-            formula=calc.formula,
+            calc_id=name,
+            name=name,
+            formula=formula,
             calc_type=calc_type,
             granularity=granularity,
             depends_on=[],
@@ -332,15 +354,15 @@ class LogicGraphBuilder:
                 sort_by=[],
                 filters=FilterContext([], [], False)
             ),
-            tableau_role=calc.role  # NEW: Preserve Tableau role
+            tableau_role=role  # Preserve Tableau role
         )
 
-        self.calculations[calc.name] = node
-        self.graph.add_node(calc.name, **node.__dict__)
+        self.calculations[name] = node
+        self.graph.add_node(name, **node.__dict__)
 
-    def _classify_calculation_type(self, calc: CalculatedField) -> CalculationType:
+    def _classify_calculation_type(self, calc: Dict[str, Any]) -> CalculationType:
         """Classify the type of calculation"""
-        formula = calc.formula.upper()
+        formula = calc.get("formula", "").upper()
 
         # Table calculations
         table_calc_keywords = [
@@ -362,9 +384,9 @@ class LogicGraphBuilder:
         # Default: calculated column (row-level)
         return CalculationType.CALCULATED_COLUMN
 
-    def _detect_granularity(self, calc: CalculatedField) -> Granularity:
+    def _detect_granularity(self, calc: Dict[str, Any]) -> Granularity:
         """Detect calculation granularity"""
-        formula = calc.formula.upper()
+        formula = calc.get("formula", "").upper()
 
         # Table calculations operate post-aggregation
         table_calc_keywords = ['WINDOW_', 'RUNNING_', 'INDEX()', 'RANK']
@@ -444,26 +466,46 @@ class LogicGraphBuilder:
     def _extract_visual_contexts(self):
         """Extract visual context for each calculation from worksheets"""
         for ws in self.worksheets:
-            # Get all fields used in this worksheet
-            all_fields = ws.rows_fields + ws.columns_fields + ws.marks_fields
+            rows_fields = ws.get("rows", [])
+            columns_fields = ws.get("cols", [])
+            
+            # Extract marks from pane_encodings
+            marks_fields = []
+            for pane in ws.get("pane_encodings", []):
+                for enc_type, field in pane.get("encodings", {}).items():
+                    marks_fields.append(field)
+            
+            # Clean fields to remove SUM() wrappers for dependency matching
+            def clean_field(f):
+                import re
+                f = re.sub(r'^[A-Z]+\(\[', '[', f)
+                f = re.sub(r'\]\)$', ']', f)
+                return f.strip('[]')
+
+            cleaned_rows = [clean_field(f) for f in rows_fields]
+            cleaned_cols = [clean_field(f) for f in columns_fields]
+            cleaned_marks = [clean_field(f) for f in marks_fields]
+
+            all_fields = cleaned_rows + cleaned_cols + cleaned_marks
+            ws_name = ws.get("name", "Unknown Sheet")
+            visual_type = ws.get("mark_type", "Unknown")
 
             for field in all_fields:
                 if field in self.calculations:
                     node = self.calculations[field]
 
                     # Add worksheet
-                    if ws.name not in node.visual_context.used_in_worksheets:
-                        node.visual_context.used_in_worksheets.append(ws.name)
+                    if ws_name not in node.visual_context.used_in_worksheets:
+                        node.visual_context.used_in_worksheets.append(ws_name)
 
                     # NEW: Add visual type
-                    if ws.visual_type not in node.visual_context.visual_types:
-                        node.visual_context.visual_types.append(ws.visual_type)
+                    if visual_type not in node.visual_context.visual_types:
+                        node.visual_context.visual_types.append(visual_type)
 
                     # Determine partition (grouping) dimensions
-                    # These are the dimensions in rows/columns (excluding the calc itself)
                     partition_dims = [
-                        f for f in ws.rows_fields + ws.columns_fields
-                        if f != field and f not in self.calculations  # Exclude other calcs
+                        f for f in cleaned_rows + cleaned_cols
+                        if f != field and f not in self.calculations
                     ]
 
                     for dim in partition_dims:

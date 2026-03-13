@@ -201,8 +201,13 @@ class DAXExecutor:
         # Only strip if the LHS looks like an identifier (not an expression)
         sql = re.sub(r'^[\w_][\w\d_\s]*\s*=\s*', '', sql, count=1)
 
+        # Strip DAX table qualifiers: Table[Column] → [Column]
+        # This prevents "Fees[income_class]" from becoming "Fees\"income_class\""
+        sql = re.sub(r"\b\w+\[", "[", sql)
+
         # Replace DAX brackets with SQL quotes
         sql = sql.replace('[', '"').replace(']', '"')
+
 
         # DAX functions to SQL equivalents
         replacements = {
@@ -212,9 +217,37 @@ class DAXExecutor:
             'MIN(': 'MIN(',
             'MAX(': 'MAX(',
             'SUM(': 'SUM(',
+            'BLANK()': 'NULL',       # DAX BLANK() → SQL NULL
+            'blank()': 'NULL',       # case-insensitive fallback
         }
         for dax_func, sql_func in replacements.items():
             sql = sql.replace(dax_func, sql_func)
+
+        # Convert DAX IF(condition, true_val, false_val) → CASE WHEN ... END
+        # DuckDB's IF() is not standard SQL
+        def _replace_dax_if(m):
+            inner = m.group(1)
+            depth = 0
+            parts = []
+            cur = []
+            for ch in inner:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                if ch == ',' and depth == 0:
+                    parts.append(''.join(cur).strip())
+                    cur = []
+                else:
+                    cur.append(ch)
+            if cur:
+                parts.append(''.join(cur).strip())
+            if len(parts) == 3:
+                return f"CASE WHEN {parts[0]} THEN {parts[1]} ELSE {parts[2]} END"
+            return m.group(0)
+
+        sql = re.sub(r'\bIF\s*\((.+)\)', _replace_dax_if, sql, flags=re.IGNORECASE | re.DOTALL)
+
 
         # Handle DIVIDE(numerator, denominator, alternate)
         # Convert to: numerator / NULLIF(denominator, 0)

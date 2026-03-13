@@ -363,50 +363,56 @@ class TruthMapExtractor:
         sql = re.sub(r'"([^"]+)\s+\([^)]+\)"', r'"\1"', sql)
 
         # ── 1b. Tableau string literals in double quotes → SQL single quotes ─
-        # Tableau string comparisons are Case-Insensitive. SQL is Case-Sensitive.
-        # [income_class]="cross sell" vs "Cross Sell" in DB data.
-        # We will wrap identifiers in LOWER() and lower case the string literal
-        # if accompanied by an = or <> or != operator.
+        # In Tableau syntax:
+        #   [Field Name] = "string value"  → double quotes are ALWAYS string literals
+        #   [Field Name] → "Field Name"    → already converted to double-quoted column above
+        # So any quoted token that appears AFTER an operator ( =, !=, <>, <, > )
+        # must be a string literal and should become a single-quoted SQL string.
+        # We also LOWER() both sides for case-insensitive comparison.
         
         def _fix_string_literal(m):
             op = m.group(1).strip()
             content = m.group(2)
             
-            # Is it a string literal? (has space or special chars)
-            is_literal = False 
-            if ' ' in content or not re.match(r'^[\w]+$', content):
-                is_literal = True
-                
-            if is_literal:
-                quote = "'"
-                val = content.lower() # Lowercase the literal for comparison
-            else:
-                quote = '"'
-                val = content
-                
-            return f" {op} {quote}{val}{quote}"
+            # Always treat as string literal — Tableau uses double-quotes for strings,
+            # column refs were already converted from [Field] → "Field" above.
+            # We lower-case the value since Tableau comparisons are case-insensitive.
+            return f" {op} '{content.lower()}'"
 
-        # Apply to double-quoted tokens that follow =, <>, !=
-        # This regex now captures the operator (group 1) and the token (group 2)
+        # Apply to double-quoted tokens that follow =, <>, !=, <, >
         sql = re.sub(
             r'([=!<>]+)\s*"([^"]+)"',
             _fix_string_literal,
             sql
         )
         
-        # Now find any identifier immediately before an operator and wrap in LOWER
+        # Now wrap the column identifier before the operator in LOWER()
         # e.g., "income_class"='cross sell' → LOWER("income_class")='cross sell'
-        # We do this for string literals only (which now have single quotes)
         sql = re.sub(
             r'"([^"]+)"\s*([=!<>]+)\s*\'([^\']+)\'',
             r"""LOWER("\1")\2'\3'""",
             sql
         )
 
-        # Handle THEN "value" and ELSE "value" where value has spaces (string literals)
+        # Handle THEN "value" and ELSE "value" where value has spaces → SQL string literal
+        # e.g., THEN "cross sell" → THEN 'cross sell'
+        # e.g., THEN "Amount"     → THEN "Amount"  (column ref, no conversion needed)
+        # We detect string literals by: lowercase-only, has spaces, or is a known word value
         sql = re.sub(
             r'\b(THEN|ELSE)\s+"([^"]+)"',
-            lambda m: f"{m.group(1)} '{m.group(2)}'" if ' ' in m.group(2) else f'{m.group(1)} "{m.group(2)}"',
+            lambda m: (
+                f"{m.group(1)} '{m.group(2).lower()}'"  # string literal → single-quoted
+                if (
+                    ' ' in m.group(2)               # has spaces (e.g. 'cross sell')
+                    or m.group(2).islower()          # all-lowercase (e.g. 'open', 'new')
+                    or m.group(2).lower() in {       # known Tableau string values
+                        'true', 'false', 'null', 'yes', 'no', 'open', 'closed',
+                        'new', 'renewal', 'qualify', 'converted', 'pending', 'active',
+                        'inactive', 'complete', 'completed', 'incomplete', 'won', 'lost'
+                    }
+                )
+                else f'{m.group(1)} "{m.group(2)}"'  # column ref → keep double-quoted
+            ),
             sql, flags=re.IGNORECASE
         )
 
@@ -551,8 +557,11 @@ class TruthMapExtractor:
                 if not calc_pattern_re.match(c)   # not a Tableau internal calc name
                 and len(c) > 1                     # not a single char
                 and ' ' not in c                   # not a string literal with spaces (e.g. "cross sell")
-                and c.lower() not in {             # not common SQL-string values
-                    'open', 'closed', 'true', 'false', 'null', 'yes', 'no'
+                and c.lower() not in {             # not common SQL-string values or Tableau literals
+                    'open', 'closed', 'true', 'false', 'null', 'yes', 'no',
+                    'new', 'renewal', 'qualify', 'converted', 'pending', 'active',
+                    'inactive', 'complete', 'completed', 'incomplete', 'won', 'lost',
+                    'in progress', 'on hold', 'cancelled', 'canceled'
                 }
                 and not c[0].isdigit()             # not a number
             }

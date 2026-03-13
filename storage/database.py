@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS tableau_workbooks (
     migration_id TEXT NOT NULL REFERENCES migration_jobs(migration_id) ON DELETE CASCADE,
     filename TEXT NOT NULL,
     file_path TEXT,
+    raw_model TEXT,  -- NEW: Complete Tableau extraction JSON
     worksheet_count INTEGER DEFAULT 0,
     dashboard_count INTEGER DEFAULT 0,
     data_source_count INTEGER DEFAULT 0,

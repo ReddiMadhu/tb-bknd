@@ -222,6 +222,20 @@ async def get_workbooks(
     }
 
 
+@router.get("/{migration_id}/workbooks/{workbook_id}/model")
+async def get_workbook_model(migration_id: str, workbook_id: str):
+    """
+    Get the complete raw JSON model natively extracted from the Tableau workbook
+    """
+    workbooks = migration_store.get_workbooks_by_migration(migration_id)
+    workbook = next((wb for wb in workbooks if wb.workbook_id == workbook_id), None)
+    
+    if not workbook:
+        raise HTTPException(status_code=404, detail="Workbook not found")
+        
+    return workbook.raw_model or {}
+
+
 @router.get("/{migration_id}/calculations")
 async def get_calculations(
     migration_id: str,
@@ -653,7 +667,6 @@ async def export_powerbi_artifacts(migration_id: str):
             import pandas as pd
             from io import BytesIO
             import re
-            from src.tableau.twb_parser import TableauTWBParser
             from src.tableau.hyper_profiler import HyperDataProfiler
 
             # --- 1. PREPARE DATA ---
@@ -1287,20 +1300,17 @@ async def get_data_quality(migration_id: str):
         for workbook in workbooks:
             logger.info(f"[DATA QUALITY] Processing workbook: {workbook.filename}, file_path: {workbook.file_path}")
 
-            # FIX: Parse TWBX dynamically to get Hyper path (hyper_path field doesn't exist in database)
-            if workbook.file_path and workbook.file_path.endswith('.twbx'):
+            # Use raw_model to find Hyper path
+            model = workbook.raw_model or {}
+            hyper_path = None
+            for conn in model.get("connections", []):
+                if conn.get("type") in ("hyper", "federated") and conn.get("filename"):
+                    hyper_path = conn.get("filename")
+                    break
+
+            if hyper_path:
                 try:
-                    from src.tableau.twb_parser import TableauTWBParser
-
-                    logger.info(f"[DATA QUALITY] Parsing TWBX file: {workbook.file_path}")
-                    # Extract Hyper file from TWBX
-                    parser = TableauTWBParser(workbook.file_path)
-                    if not parser.hyper_files:
-                        logger.warning(f"[DATA QUALITY] No Hyper files found in {workbook.filename}")
-                        continue
-
-                    hyper_path = str(parser.hyper_files[0])
-                    logger.info(f"[DATA QUALITY] Found Hyper file: {hyper_path}")
+                    logger.info(f"[DATA QUALITY] Found Hyper path in model: {hyper_path}")
 
                     profiler = HyperDataProfiler(hyper_path)
                     tables = profiler.list_tables()
@@ -1455,20 +1465,17 @@ async def get_table_classifications(migration_id: str):
         for workbook in workbooks:
             logger.info(f"[TABLE CLASSIFICATIONS] Processing workbook: {workbook.filename}, file_path: {workbook.file_path}")
 
-            # FIX: Parse TWBX dynamically to get Hyper path (hyper_path field doesn't exist in database)
-            if workbook.file_path and workbook.file_path.endswith('.twbx'):
+            # Use raw_model to find Hyper path
+            model = workbook.raw_model or {}
+            hyper_path = None
+            for conn in model.get("connections", []):
+                if conn.get("type") in ("hyper", "federated") and conn.get("filename"):
+                    hyper_path = conn.get("filename")
+                    break
+
+            if hyper_path:
                 try:
-                    from src.tableau.twb_parser import TableauTWBParser
-
-                    logger.info(f"[TABLE CLASSIFICATIONS] Parsing TWBX file: {workbook.file_path}")
-                    # Extract Hyper file from TWBX
-                    parser = TableauTWBParser(workbook.file_path)
-                    if not parser.hyper_files:
-                        logger.warning(f"[TABLE CLASSIFICATIONS] No Hyper files found in {workbook.filename}")
-                        continue
-
-                    hyper_path = str(parser.hyper_files[0])
-                    logger.info(f"[TABLE CLASSIFICATIONS] Found Hyper file: {hyper_path}")
+                    logger.info(f"[TABLE CLASSIFICATIONS] Found Hyper path: {hyper_path}")
 
                     profiler = HyperDataProfiler(hyper_path)
                     tables = profiler.list_tables()
@@ -1582,44 +1589,99 @@ async def get_suggested_relationships(migration_id: str):
         all_tables_data = []
 
         for workbook in workbooks:
-            if hasattr(workbook, 'hyper_path') and workbook.hyper_path:
+            # Hyper paths are stored in raw_model['hyper_files'] (set by orchestrator Phase 1)
+            raw_model = workbook.raw_model or {}
+            hyper_files = raw_model.get("hyper_files", [])
+
+            for hyper_path in hyper_files:
+                if not hyper_path or not str(hyper_path).endswith(".hyper"):
+                    continue
                 try:
-                    profiler = HyperDataProfiler(workbook.hyper_path)
+                    profiler = HyperDataProfiler(str(hyper_path))
                     tables = profiler.list_tables()
 
                     for table in tables:
-                        # Read table data
                         df = profiler.read_table(table, limit=10000)
                         all_tables_data.append({
-                            "name": table,
+                            "name": profiler.get_clean_table_name(table),
                             "data": df
                         })
 
                 except Exception as e:
-                    logger.error(f"Failed to load table data: {e}")
+                    logger.error(f"Failed to load table data from {hyper_path}: {e}")
                     continue
 
         if not all_tables_data:
+            logger.warning(f"No table data found for migration {migration_id} — no hyper files or all failed")
+            return {"relationships": []}
+
+        # Build profiles + dataframes dicts for RelationshipDetector
+        profiles: dict = {}   # {table_name: {columns: {col_name: profile_dict}}}
+        dataframes: dict = {} # {table_name: pd.DataFrame}
+
+        for td in all_tables_data:
+            table_name = td["name"]
+            df = td["data"]
+            if df is None or df.empty:
+                continue
+
+            col_profiles = {}
+            for col in df.columns:
+                series = df[col].dropna()
+                n_unique = series.nunique()
+                n_total = len(series)
+                null_pct = (df[col].isna().sum() / len(df)) * 100 if len(df) else 0
+                unique_pct = (n_unique / n_total * 100) if n_total else 0
+
+                # Infer basic data type
+                dtype = str(df[col].dtype)
+                if "int" in dtype or "float" in dtype:
+                    data_type = "numeric"
+                elif "datetime" in dtype or "date" in dtype:
+                    data_type = "datetime"
+                else:
+                    data_type = "string"
+
+                import re as _re
+                normalized = _re.sub(r'[^a-z0-9]', '', col.lower())
+                col_profiles[col] = {
+                    "data_type": data_type,
+                    "normalized_name": normalized,
+                    "name_variations": [normalized],
+                    "cardinality": n_unique,
+                    "null_percent": null_pct,
+                    "unique_percent": unique_pct,
+                    "key_features": {
+                        "is_unique": n_unique == n_total and n_total > 0,
+                    },
+                }
+
+            profiles[table_name] = {"columns": col_profiles}
+            dataframes[table_name] = df
+
+        if len(profiles) < 2:
+            logger.info(f"Only {len(profiles)} table(s) — cannot detect cross-table relationships")
             return {"relationships": []}
 
         # Run relationship detection
-        detector = RelationshipDetector()
-        relationships = detector.discover_relationships(all_tables_data)
+        detector = RelationshipDetector(profiles=profiles, dataframes=dataframes)
+        candidates = detector.generate_candidates()
 
-        # Format for frontend
+        # Format for frontend — map RelationshipCandidate fields
         formatted_relationships = []
-        for rel in relationships:
+        for cand in candidates:
             formatted_relationships.append({
-                "from_table": rel.get("from_table"),
-                "from_column": rel.get("from_column"),
-                "to_table": rel.get("to_table"),
-                "to_column": rel.get("to_column"),
-                "relationship_type": rel.get("relationship_type", "MANY_TO_ONE"),
-                "confidence_score": rel.get("confidence_score", 0),
-                "detection_method": rel.get("detection_method", "PATTERN_MATCH"),
-                "data_overlap": rel.get("data_overlap", 0)
+                "from_table": cand.source_file,
+                "from_column": cand.source_column,
+                "to_table": cand.target_file,
+                "to_column": cand.target_column,
+                "relationship_type": cand.relationship_type,
+                "confidence_score": cand.confidence_score,
+                "detection_method": cand.detection_method,
+                "data_overlap": cand.statistics.get("value_overlap_percent", 0),
             })
 
+        logger.info(f"✅ Detected {len(formatted_relationships)} relationships for {migration_id}")
         return {"relationships": formatted_relationships}
 
     except Exception as e:
@@ -1656,27 +1718,20 @@ async def get_filters(migration_id: str):
 
         all_filters = []
 
-        # Import TWB parser
-        from src.tableau.twb_parser import TableauTWBParser
-
         for workbook in workbooks:
-            if hasattr(workbook, 'twb_path') and workbook.twb_path:
-                try:
-                    parser = TableauTWBParser(workbook.twb_path)
-                    filters = parser.parse_filters()
+            model = workbook.raw_model or {}
+            worksheets = model.get("worksheets", [])
 
-                    for f in filters:
-                        all_filters.append({
-                            "field_name": f.get("field_name"),
-                            "filter_type": f.get("filter_type", "categorical"),
-                            "worksheet_name": f.get("worksheet_name"),
-                            "is_context_filter": f.get("is_context_filter", False),
-                            "values": f.get("values", [])
-                        })
-
-                except Exception as e:
-                    logger.error(f"Failed to parse filters: {e}")
-                    continue
+            for ws in worksheets:
+                ws_filters = ws.get("filters", [])
+                for f in ws_filters:
+                    all_filters.append({
+                        "field_name": f.get("field"),
+                        "filter_type": "categorical", # Mapping from mark_type/datatype could be better
+                        "worksheet_name": ws.get("name"),
+                        "is_context_filter": False, # Would need deeper model parsing
+                        "values": [] # New model might not store all values
+                    })
 
         return {"filters": all_filters}
 
@@ -1795,21 +1850,15 @@ async def download_conversion_report(
         # ---------------------------------------------------------
         # 1. Build Replacement Map (Internal Name -> Caption)
         # ---------------------------------------------------------
-        replacement_map = {}
         try:
             workbooks = migration_store.get_workbooks_by_migration(migration_id)
             for workbook in workbooks:
-                if workbook.file_path:
-                    try:
-                        parser = TableauTWBParser(workbook.file_path)
-                        # We only need calculated fields to get captions
-                        raw_calcs = parser.parse_calculated_fields()
-                        for cf in raw_calcs:
-                            display_name = cf.caption if cf.caption else cf.name
-                            if cf.name:
-                                replacement_map[cf.name] = display_name
-                    except Exception as e:
-                        logger.warning(f"Failed to parse workbook {workbook.filename} for captions: {e}")
+                model = workbook.raw_model or {}
+                raw_calcs = [c for c in model.get("columns", []) if c.get("formula")]
+                for cf in raw_calcs:
+                    display_name = cf.get("caption") or cf.get("internal_name")
+                    if cf.get("internal_name"):
+                        replacement_map[cf.get("internal_name")] = display_name
         except Exception as e:
             logger.error(f"Failed to build replacement map: {e}")
 
@@ -2059,7 +2108,6 @@ async def download_all_artifacts(migration_id: str):
         import pandas as pd
         import re
         from io import BytesIO
-        from src.tableau.twb_parser import TableauTWBParser
         from src.tableau.hyper_profiler import HyperDataProfiler
 
         # Create ZIP in memory
@@ -2087,58 +2135,55 @@ async def download_all_artifacts(migration_id: str):
             try:
                 workbooks = migration_store.get_workbooks_by_migration(migration_id)
                 for workbook in workbooks:
-                    if workbook.file_path:
+                    model = workbook.raw_model or {}
+
+                    # Build caption replacement map from raw_model columns
+                    raw_calcs = [c for c in model.get("columns", []) if c.get("formula")]
+                    for cf in raw_calcs:
+                        display_name = cf.get("caption") or cf.get("internal_name")
+                        if cf.get("internal_name"):
+                            replacement_map[cf.get("internal_name")] = display_name
+
+                    # Store worksheets for analysis
+                    ws_data = model.get("worksheets", [])
+                    workbooks_list.append({
+                        "filename": workbook.filename,
+                        "worksheets": ws_data
+                    })
+
+                    # -------------------------------------------------------
+                    # Profile Data Tables — use hyper_files (set by orchestrator)
+                    # -------------------------------------------------------
+                    hyper_files = model.get("hyper_files", [])
+                    for hyper_path in hyper_files:
+                        if not hyper_path or not str(hyper_path).endswith(".hyper"):
+                            continue
                         try:
-                            parser = TableauTWBParser(workbook.file_path)
-                            
-                            # Parse Calculated Fields for Captions
-                            raw_calcs = parser.parse_calculated_fields()
-                            for cf in raw_calcs:
-                                display_name = cf.caption if cf.caption else cf.name
-                                if cf.name:
-                                    replacement_map[cf.name] = display_name
-                                    
-                            # Parse Worksheets for Analysis
-                            ws_data = parser.parse_worksheets()
-                            workbooks_list.append({
-                                "filename": workbook.filename,
-                                "worksheets": ws_data
-                            })
-
-                            # Profile Data Tables (Hyper Files)
-                            if parser.hyper_files:
+                            profiler = HyperDataProfiler(str(hyper_path))
+                            tables = profiler.list_tables()
+                            for table in tables:
                                 try:
-                                    hyper_path = str(parser.hyper_files[0])
-                                    profiler = HyperDataProfiler(hyper_path)
-                                    tables = profiler.list_tables()
-                                    
-                                    for table in tables:
-                                        try:
-                                            # Strip quotes for profiling
-                                            table_unquoted = table.strip('"').replace('"."', '.')
-                                            # Light profiling
-                                            table_profile = profiler.profile_table(table_unquoted, sample_size=100)
-                                            
-                                            # Format columns as: Name (TYPE)
-                                            col_details = [f"{col.column_name} ({col.data_type})" for col in table_profile.columns]
-                                            
-                                            tables_report_data.append({
-                                                "Workbook": workbook.filename,
-                                                "Table Name": table,
-                                                "Row Count": table_profile.row_count,
-                                                "Column Count": len(col_details),
-                                                "Column Names": ", ".join(col_details)
-                                            })
-                                        except Exception as e:
-                                            logger.warning(f"Failed to profile table {table}: {e}")
-                                            
-                                except Exception as e:
-                                    logger.warning(f"Failed to profile hyper file for {workbook.filename}: {e}")
+                                    table_unquoted = str(table).strip('"').replace('"."', '.')
+                                    clean_name = profiler.get_clean_table_name(table)
+                                    table_profile = profiler.profile_table(table_unquoted, sample_size=100)
+                                    col_details = [
+                                        f"{col.column_name} ({col.data_type})"
+                                        for col in table_profile.columns
+                                    ]
+                                    tables_report_data.append({
+                                        "Workbook": workbook.filename,
+                                        "Table Name": clean_name,
+                                        "Row Count": table_profile.row_count,
+                                        "Column Count": len(col_details),
+                                        "Columns": ", ".join(col_details)
+                                    })
+                                except Exception as te:
+                                    logger.warning(f"Failed to profile table {table}: {te}")
+                        except Exception as he:
+                            logger.warning(f"Failed to profile hyper {hyper_path}: {he}")
 
-                        except Exception as e:
-                            logger.warning(f"Failed to parse workbook {workbook.filename}: {e}")
             except Exception as e:
-                logger.error(f"Failed to build replacment map: {e}")
+                logger.error(f"Failed to build replacement map: {e}")
 
             # Helper to get friendly name
             def get_friendly_name(name):
@@ -2183,38 +2228,72 @@ async def download_all_artifacts(migration_id: str):
             for wb_data in workbooks_list:
                 filename = wb_data['filename']
                 for ws in wb_data['worksheets']:
-                    # Resolve Friendly Names for Lists
-                    dimensions = [get_friendly_name(d) for d in (ws.dimensions or [])]
-                    measures = [get_friendly_name(m.name if hasattr(m, 'name') else m) for m in (ws.measures or [])]
-                    base_measures = [get_friendly_name(m.name) for m in (ws.measures or []) if hasattr(m, 'type') and m.type == 'base_measure']
-                    
-                    # Resolve Axes
-                    # axes is a dictionary, not an object
-                    rows = ws.axes.get('rows') if ws.axes else None
-                    cols = ws.axes.get('columns') if ws.axes else None
-                    
-                    # Fallback logic for Cards (similar to frontend)
-                    if not rows and ws.visual_type.value == 'text' and ws.measures: 
-                         # Roughly mapping text tables/cards
-                         rows = get_friendly_name(ws.measures[0].name if hasattr(ws.measures[0], 'name') else ws.measures[0])
-                    else:
-                        rows = get_friendly_name(rows) if rows else '-'
+                    # ws is a dict from raw_model['worksheets']
+                    ws_name = ws.get("name", "")
+                    visual_type = ws.get("mark_type") or ws.get("chart_type", "Automatic")
 
-                    if not cols and ws.visual_type.value == 'text' and ws.dimensions:
-                        cols = get_friendly_name(ws.dimensions[0])
-                    else:
-                        cols = get_friendly_name(cols) if cols else '-'
+                    # --- Rows / Columns from raw shelf fields ---
+                    rows_fields = ws.get("rows_fields", []) or ws.get("rows", [])
+                    cols_fields = ws.get("columns_fields", []) or ws.get("cols", [])
+                    rows_str = ", ".join(get_friendly_name(str(r)) for r in rows_fields if r) or "-"
+                    cols_str = ", ".join(get_friendly_name(str(c)) for c in cols_fields if c) or "-"
+
+                    # --- Dimensions from raw_model (or fallback from axes.dimensions) ---
+                    raw_dims = ws.get("dimensions", [])
+                    dimensions = [get_friendly_name(d) for d in raw_dims if d]
+
+                    # --- Measures (calculated + base) ---
+                    measures_raw = ws.get("measures", [])
+                    calc_fields_list = ws.get("calculated_fields", [])
+                    all_measures = []
+                    calc_names = []
+                    base_names = []
+                    for m in measures_raw:
+                        m_name = m.get("name") if isinstance(m, dict) else str(m)
+                        m_type = m.get("type", "") if isinstance(m, dict) else ""
+                        friendly = get_friendly_name(m_name)
+                        all_measures.append(friendly)
+                        if m_type == "calculated":
+                            calc_names.append(friendly)
+                        else:
+                            base_names.append(friendly)
+
+                    # If measures are empty, fallback: extract calc field names from calculated_fields
+                    if not calc_names and calc_fields_list:
+                        for cf in calc_fields_list:
+                            cf_name = cf.get("name") if isinstance(cf, dict) else str(cf)
+                            friendly = get_friendly_name(cf_name)
+                            calc_names.append(friendly)
+                            all_measures.append(friendly)
+
+                    # --- Filters ---
+                    filters_raw = ws.get("filters", [])
+                    filter_fields = [get_friendly_name(f.get("field", "")) for f in filters_raw if isinstance(f, dict) and f.get("field")]
+                    filters_str = ", ".join(filter_fields) if filter_fields else "-"
+
+                    # --- Calculated field formulas (from calculated_fields list) ---
+                    calc_details = []
+                    for cf in calc_fields_list:
+                        if isinstance(cf, dict):
+                            cf_name = get_friendly_name(cf.get("name", ""))
+                            cf_formula = cf.get("formula", "")
+                            if cf_name:
+                                calc_details.append(f"{cf_name}: {cf_formula}" if cf_formula else cf_name)
 
                     worksheet_report_data.append({
                         "Workbook": filename,
-                        "Worksheet Name": ws.name,
-                        "Chart Type": ws.visual_type.value if ws.visual_type else "Automatic",
-                        "Dimensions": ", ".join(dimensions),
-                        "Measures": ", ".join(measures),
-                        "Base Measures": ", ".join(base_measures),
-                        "Rows": rows,
-                        "Columns": cols
+                        "Worksheet Name": ws_name,
+                        "Chart Type": visual_type,
+                        "Rows Shelf": rows_str,
+                        "Columns Shelf": cols_str,
+                        "Dimensions": ", ".join(dimensions) if dimensions else "-",
+                        "All Measures": ", ".join(all_measures) if all_measures else "-",
+                        "Calculated Fields": ", ".join(calc_names) if calc_names else "-",
+                        "Calculated Field Formulas": " | ".join(calc_details) if calc_details else "-",
+                        "Base Measures": ", ".join(base_names) if base_names else "-",
+                        "Filters": filters_str,
                     })
+
 
             # --- 4. WRITE EXCEL FILE TO ZIP ---
             excel_buffer = BytesIO()
@@ -2247,17 +2326,64 @@ async def download_all_artifacts(migration_id: str):
 
             excel_buffer.seek(0)
             zip_file.writestr(f"migration_report_{migration_id}.xlsx", excel_buffer.getvalue())
+            # Include PBIP + table_data from exports/{migration_id}/
+            # The orchestrator writes to: exports/{migration_id}/pbip_output/
+            #                             exports/{migration_id}/table_data/
+            # Try absolute path first (relative to this file), then CWD fallback
+            # ---------------------------------------------------------
+            bknd_root = Path(__file__).resolve().parent.parent.parent  # api/routers -> api -> bknd
+            export_dir_abs = bknd_root / "exports" / migration_id
+            export_dir_rel = Path("exports") / migration_id
+
+            # Pick whichever exists
+            export_dir = export_dir_abs if export_dir_abs.exists() else export_dir_rel
+            logger.info(f"  Export dir: {export_dir} (exists={export_dir.exists()})")
+
+            pbip_files_added = False
+            table_data_files_added = 0
+
+            if export_dir.exists():
+                # Walk every file under exports/{mig_id}/ and add to zip preserving structure
+                for fp in export_dir.rglob("*"):
+                    if not fp.is_file():
+                        continue
+                    rel = fp.relative_to(export_dir)
+                    rel_str = str(rel)
+                    arcname = str(rel).replace("\\", "/")
+
+                    # Skip any already-generated xlsx reports (not needed twice)
+                    if fp.suffix == ".xlsx" and "report" in fp.name:
+                        continue
+
+                    if rel_str.startswith("pbip_output"):
+                        # Put under pbip_project/ in ZIP
+                        inner = fp.relative_to(export_dir / "pbip_output")
+                        arcname = f"pbip_project/{str(inner).replace(chr(92), '/')}"
+                        pbip_files_added = True
+                    elif rel_str.startswith("table_data"):
+                        arcname = f"table_data/{fp.name}"
+                        table_data_files_added += 1
+
+                    zip_file.writestr(arcname, fp.read_bytes())
+
+            if pbip_files_added:
+                logger.info(f"  ✓ Included PBIP project from {export_dir / 'pbip_output'}")
+            else:
+                logger.warning(f"  ⚠ PBIP not found under {export_dir}")
+
+            if table_data_files_added:
+                logger.info(f"  ✓ Included {table_data_files_added} table data file(s)")
 
             # ---------------------------------------------------------
-            # Generate model.bim (Semantic Model)
+            # Generate model.bim (Semantic Model) — fallback / bonus file
             # ---------------------------------------------------------
             try:
-                # Build valid model.bim structure for Tabular Editor import
                 bim_measures = []
                 for c in conversions:
                     if c.dax_formula:
+                        calc_obj = calc_map.get(c.calc_id)
                         bim_measures.append({
-                            "name": get_friendly_name(calc_map.get(c.calc_id).calc_name) if calc_map.get(c.calc_id) else c.calc_id,
+                            "name": get_friendly_name(calc_obj.calc_name) if calc_obj else c.calc_id,
                             "expression": c.dax_formula,
                             "formatString": "#,##0.00"
                         })
@@ -2269,9 +2395,9 @@ async def download_all_artifacts(migration_id: str):
                         "culture": "en-US",
                         "tables": [
                             {
-                                "name": "_Calculations", 
+                                "name": "_Calculations",
                                 "columns": [
-                                    { "name": "Column", "dataType": "string", "sourceColumn": "Column" }
+                                    {"name": "Column", "dataType": "string", "sourceColumn": "Column"}
                                 ],
                                 "partitions": [
                                     {
@@ -2288,23 +2414,30 @@ async def download_all_artifacts(migration_id: str):
                         ]
                     }
                 }
-                zip_file.writestr(
-                    "model.bim",
-                    json.dumps(model_bim, indent=2)
-                )
+                zip_file.writestr("model.bim", json.dumps(model_bim, indent=2))
             except Exception as e:
                 logger.error(f"Failed to generate model.bim: {e}")
-                zip_file.writestr("model_bim_error.txt", f"Failed to generate model.bim: {str(e)}")
+                zip_file.writestr("model_bim_error.txt", f"model.bim generation failed: {e}")
 
-            # 5. Table data Excel files (Keep existing behavior)
-            export_dir = Path("exports") / migration_id
-            table_data_dir = export_dir / "table_data"
-            if table_data_dir.exists():
-                for excel_file in table_data_dir.glob("*.xlsx"):
-                    zip_file.write(excel_file, f"table_data/{excel_file.name}")
-
-            # 6. Add minimal update info
-            zip_file.writestr("README.txt", f"Migration Report for {migration_id}\nGenerated: {datetime.now().isoformat()}")
+            # README
+            readme_lines = [
+                "Tableau to Power BI Migration Export",
+                "=====================================",
+                f"Migration ID: {migration_id}",
+                f"Generated:    {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                "",
+                "Contents:",
+                f"1. migration_report_{migration_id}.xlsx  — DAX Conversions, Worksheet Analysis, Data Tables",
+            ]
+            if pbip_files_added:
+                readme_lines += [
+                    "2. pbip_project/  — Full Power BI project (.pbip structure)",
+                    "   To open: extract ZIP → double-click the .pbip file in Power BI Desktop.",
+                ]
+            if table_data_files_added:
+                readme_lines.append(f"3. table_data/  — {table_data_files_added} Excel table export(s)")
+            readme_lines.append("4. model.bim  — Alternative semantic model (Tabular Editor import)")
+            zip_file.writestr("README.txt", "\n".join(readme_lines))
 
         zip_buffer.seek(0)
 

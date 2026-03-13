@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from enum import Enum
 from loguru import logger
 
-from src.tableau.twb_parser import TableauFilter, TableauParameter
 
 
 class PowerBIFilterScope(Enum):
@@ -73,7 +72,7 @@ class FilterParameterConverter:
 
     def convert_filters(
         self,
-        tableau_filters: List[TableauFilter],
+        tableau_filters: List[Dict[str, Any]],
         worksheets: Optional[List[str]] = None
     ) -> List[PowerBIFilter]:
         """
@@ -97,22 +96,23 @@ class FilterParameterConverter:
                 if pbi_filter:
                     powerbi_filters.append(pbi_filter)
                     logger.debug(
-                        f"  Converted filter: {tf.field} ({tf.filter_type}) "
+                        f"  Converted filter: {tf.get('field')} ({tf.get('filter_type')}) "
                         f"-> {pbi_filter.scope.value}-level"
                     )
 
             except Exception as e:
-                logger.warning(f"Failed to convert filter {tf.field}: {e}")
+                logger.warning(f"Failed to convert filter {tf.get('field')}: {e}")
 
         logger.info(f"Converted {len(powerbi_filters)} filters")
 
         return powerbi_filters
 
-    def _convert_single_filter(self, tableau_filter: TableauFilter) -> Optional[PowerBIFilter]:
+    def _convert_single_filter(self, tableau_filter: Dict[str, Any]) -> Optional[PowerBIFilter]:
         """Convert a single Tableau filter to Power BI filter"""
 
         # Determine scope based on context filter flag
-        if tableau_filter.is_context_filter:
+        is_context = tableau_filter.get("is_context_filter", False)
+        if is_context:
             # Context filters → Report-level (affects everything)
             scope = PowerBIFilterScope.REPORT
         else:
@@ -120,23 +120,23 @@ class FilterParameterConverter:
             scope = PowerBIFilterScope.PAGE
 
         # Determine filter type
-        filter_type = self._map_filter_type(tableau_filter.filter_type)
+        filter_type = self._map_filter_type(tableau_filter.get("filter_type", "categorical"))
 
         # Map operator
-        operator = self._map_filter_operator(tableau_filter.operator)
+        operator = self._map_filter_operator(tableau_filter.get("operator", "In"))
 
         # Extract table and column from field name
         # Tableau format: "TableName.FieldName" or just "FieldName"
-        table_name, column_name = self._parse_field_name(tableau_filter.field)
+        table_name, column_name = self._parse_field_name(tableau_filter.get("field", ""))
 
         powerbi_filter = PowerBIFilter(
             target_table=table_name,
             target_column=column_name,
             filter_type=filter_type,
             scope=scope,
-            values=tableau_filter.values,
+            values=tableau_filter.get("values", []),
             operator=operator,
-            is_required=tableau_filter.is_context_filter
+            is_required=is_context
         )
 
         return powerbi_filter
@@ -193,7 +193,7 @@ class FilterParameterConverter:
 
     def convert_parameters(
         self,
-        tableau_parameters: List[TableauParameter]
+        tableau_parameters: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """
         Convert Tableau parameters to Power BI equivalents
@@ -215,17 +215,17 @@ class FilterParameterConverter:
                     whatif = self._convert_to_whatif(tp)
                     whatif_parameters.append(whatif)
 
-                    logger.debug(f"  Converted parameter '{tp.name}' to What-If parameter")
+                    logger.debug(f"  Converted parameter '{tp.get('name')}' to What-If parameter")
 
                 else:
                     # Text/List parameters → Disconnected slicer table
                     slicer_table = self._convert_to_slicer_table(tp)
                     slicer_tables.append(slicer_table)
 
-                    logger.debug(f"  Converted parameter '{tp.name}' to slicer table")
+                    logger.debug(f"  Converted parameter '{tp.get('name')}' to slicer table")
 
             except Exception as e:
-                logger.warning(f"Failed to convert parameter {tp.name}: {e}")
+                logger.warning(f"Failed to convert parameter {tp.get('name')}: {e}")
 
         logger.info(
             f"Converted {len(whatif_parameters)} What-If parameters, "
@@ -237,12 +237,12 @@ class FilterParameterConverter:
             "slicer_tables": slicer_tables
         }
 
-    def _is_numeric_parameter(self, param: TableauParameter) -> bool:
+    def _is_numeric_parameter(self, param: Dict[str, Any]) -> bool:
         """Check if parameter is numeric"""
         numeric_types = ["integer", "int", "real", "number", "decimal", "float"]
-        return param.datatype.lower() in numeric_types
+        return param.get("datatype", "").lower() in numeric_types
 
-    def _convert_to_whatif(self, param: TableauParameter) -> WhatIfParameter:
+    def _convert_to_whatif(self, param: Dict[str, Any]) -> WhatIfParameter:
         """
         Convert numeric Tableau parameter to What-If parameter
 
@@ -252,7 +252,8 @@ class FilterParameterConverter:
         - User selects value via slicer
         """
         # Extract min/max from allowable values
-        numeric_values = [float(v) for v in param.allowable_values if self._is_numeric(v)]
+        allowable_values = param.get("allowable_values", [])
+        numeric_values = [float(v) for v in allowable_values if self._is_numeric(v)]
 
         if numeric_values:
             min_value = min(numeric_values)
@@ -271,10 +272,11 @@ class FilterParameterConverter:
             increment = 1.0
 
         # Parse default value
-        default_value = float(param.current_value) if self._is_numeric(param.current_value) else min_value
+        current_value = param.get("current_value", "")
+        default_value = float(current_value) if self._is_numeric(current_value) else min_value
 
         whatif = WhatIfParameter(
-            name=param.name,
+            name=param.get("name", "UnknownParameter"),
             min_value=min_value,
             max_value=max_value,
             increment=increment,
@@ -284,16 +286,16 @@ class FilterParameterConverter:
 
         return whatif
 
-    def _convert_to_slicer_table(self, param: TableauParameter) -> SlicerTable:
+    def _convert_to_slicer_table(self, param: Dict[str, Any]) -> SlicerTable:
         """
         Convert text Tableau parameter to disconnected slicer table
 
         Creates a single-column table with allowed values
         """
         slicer_table = SlicerTable(
-            name=f"Param_{param.name}",
-            values=param.allowable_values,
-            default_value=param.current_value
+            name=f"Param_{param.get('name', 'Unknown')}",
+            values=param.get("allowable_values", []),
+            default_value=param.get("current_value", None)
         )
 
         return slicer_table
@@ -399,8 +401,8 @@ GENERATESERIES(
 
     def generate_conversion_report(
         self,
-        tableau_filters: List[TableauFilter],
-        tableau_parameters: List[TableauParameter],
+        tableau_filters: List[Dict[str, Any]],
+        tableau_parameters: List[Dict[str, Any]],
         powerbi_filters: List[PowerBIFilter],
         whatif_parameters: List[WhatIfParameter],
         slicer_tables: List[SlicerTable]
@@ -429,9 +431,10 @@ GENERATESERIES(
             pbi_filter = powerbi_filters[i] if i < len(powerbi_filters) else None
 
             if pbi_filter:
+                is_context = tf.get("is_context_filter", False)
                 lines.append(
-                    f"| {tf.field} | {tf.filter_type} | "
-                    f"{'Yes' if tf.is_context_filter else 'No'} | "
+                    f"| {tf.get('field', '')} | {tf.get('filter_type', '')} | "
+                    f"{'Yes' if is_context else 'No'} | "
                     f"{pbi_filter.scope.value} | {pbi_filter.operator} |"
                 )
 

@@ -6,7 +6,6 @@ import json
 import uuid
 from loguru import logger
 
-from src.tableau.twb_parser import Worksheet, VisualType
 
 
 class PowerBIVisualType(Enum):
@@ -77,7 +76,7 @@ class VisualConverter:
 
     def convert_worksheets_to_visuals(
         self,
-        worksheets: List[Worksheet],
+        worksheets: List[Dict[str, Any]],
         auto_layout: bool = True
     ) -> List[PowerBIVisual]:
         """
@@ -107,36 +106,44 @@ class VisualConverter:
                     powerbi_visuals.append(visual)
 
                     logger.debug(
-                        f"  Converted worksheet '{worksheet.name}' "
-                        f"({worksheet.visual_type.value} → {visual.visual_type.value})"
+                        f"  Converted worksheet '{worksheet.get('name', 'Unknown')}' "
+                        f"({worksheet.get('mark_type', 'Unknown')} → {visual.visual_type.value})"
                     )
 
             except Exception as e:
-                logger.warning(f"Failed to convert worksheet {worksheet.name}: {e}")
+                logger.warning(f"Failed to convert worksheet {worksheet.get('name', 'Unknown')}: {e}")
 
         logger.info(f"Converted {len(powerbi_visuals)} visuals")
 
         return powerbi_visuals
 
-    def _convert_single_worksheet(self, worksheet: Worksheet) -> Optional[PowerBIVisual]:
+    def _convert_single_worksheet(self, worksheet: Dict[str, Any]) -> Optional[PowerBIVisual]:
         """Convert a single Tableau worksheet to Power BI visual"""
 
         # Map visual type
-        powerbi_visual_type = self._map_visual_type(worksheet.visual_type, worksheet.mark_type)
+        powerbi_visual_type = self._map_visual_type(None, worksheet.get("mark_type", "Unknown"))
+
+        # Extract marks
+        marks_fields = []
+        for pane in worksheet.get("pane_encodings", []):
+            for enc_type, field in pane.get("encodings", {}).items():
+                marks_fields.append(field)
 
         # Map fields to data roles
         data_roles = self._map_fields_to_data_roles(
             visual_type=powerbi_visual_type,
-            rows=worksheet.rows_fields,
-            columns=worksheet.columns_fields,
-            marks=worksheet.marks_fields
+            rows=worksheet.get("rows", []),
+            columns=worksheet.get("cols", []),
+            marks=marks_fields
         )
+
+        name = worksheet.get("name", "Unknown Sheet")
 
         # Create visual
         visual = PowerBIVisual(
             visual_type=powerbi_visual_type,
-            name=worksheet.name,
-            title=worksheet.name,
+            name=name,
+            title=name,
             layout=VisualLayout(x=0, y=0, width=self.DEFAULT_VISUAL_WIDTH, height=self.DEFAULT_VISUAL_HEIGHT),
             data_roles=data_roles,
             filters=[]
@@ -144,7 +151,7 @@ class VisualConverter:
 
         return visual
 
-    def _map_visual_type(self, tableau_type: VisualType, mark_type: str) -> PowerBIVisualType:
+    def _map_visual_type(self, tableau_type: Any, mark_type: str) -> PowerBIVisualType:
         """
         Map Tableau visual type to Power BI visual type
 
@@ -156,22 +163,22 @@ class VisualConverter:
         - CARD → Card
         - etc.
         """
-        mapping = {
-            VisualType.CARD: PowerBIVisualType.CARD,
-            VisualType.TEXT_TABLE: PowerBIVisualType.TABLE,
-            VisualType.MATRIX: PowerBIVisualType.MATRIX,
-            VisualType.BAR_CHART: PowerBIVisualType.CLUSTERED_BAR_CHART,
-            VisualType.LINE_CHART: PowerBIVisualType.LINE_CHART,
-            VisualType.AREA_CHART: PowerBIVisualType.AREA_CHART,
-            VisualType.PIE_CHART: PowerBIVisualType.PIE_CHART,
-            VisualType.SCATTER: PowerBIVisualType.SCATTER_CHART,
-            VisualType.MAP: PowerBIVisualType.MAP,
-        }
+        if tableau_type:
+            mapping = {
+                "CARD": PowerBIVisualType.CARD,
+                "TEXT_TABLE": PowerBIVisualType.TABLE,
+                "MATRIX": PowerBIVisualType.MATRIX,
+                "BAR_CHART": PowerBIVisualType.CLUSTERED_BAR_CHART,
+                "LINE_CHART": PowerBIVisualType.LINE_CHART,
+                "AREA_CHART": PowerBIVisualType.AREA_CHART,
+                "PIE_CHART": PowerBIVisualType.PIE_CHART,
+                "SCATTER": PowerBIVisualType.SCATTER_CHART,
+                "MAP": PowerBIVisualType.MAP,
+            }
 
-        powerbi_type = mapping.get(tableau_type)
-
-        if powerbi_type:
-            return powerbi_type
+            powerbi_type = mapping.get(str(tableau_type).split(".")[-1])
+            if powerbi_type:
+                return powerbi_type
 
         # Fallback: Use mark type
         mark_mapping = {
@@ -385,7 +392,7 @@ class VisualConverter:
 
     def generate_visual_conversion_report(
         self,
-        worksheets: List[Worksheet],
+        worksheets: List[Dict[str, Any]],
         visuals: List[PowerBIVisual]
     ) -> str:
         """
@@ -409,6 +416,8 @@ class VisualConverter:
         for i, worksheet in enumerate(worksheets):
             if i < len(visuals):
                 visual = visuals[i]
+                ws_name = worksheet.get("name", "Unknown")
+                ws_mark = worksheet.get("mark_type", "Unknown")
 
                 # Format data roles
                 roles_str = ", ".join([
@@ -416,7 +425,7 @@ class VisualConverter:
                 ])
 
                 lines.append(
-                    f"| {worksheet.name} | {worksheet.visual_type.value} | "
+                    f"| {ws_name} | {ws_mark} | "
                     f"{visual.visual_type.value} | {roles_str} |"
                 )
 

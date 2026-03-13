@@ -9,8 +9,9 @@ import uuid
 
 from storage.migration_store import MigrationStore
 from storage.preview_store import PreviewStore
-from src.tableau.twb_parser import TableauTWBParser
 from src.tableau.hyper_profiler import HyperDataProfiler
+from src.tableau.tableau_extractor import extract_tableau_model # For fallback profiling if needed
+
 
 router = APIRouter(prefix="/api/v1/migration", tags=["workbook-metadata"])
 
@@ -55,23 +56,20 @@ async def get_workbook_metadata_summary(migration_id: str):
 
         for workbook in workbooks:
             try:
-                parser = TableauTWBParser(workbook.file_path)
+                # Use raw_model from database (pre-parsed)
+                model = workbook.raw_model or {}
 
-                # Get counts only (fast)
-                worksheets = parser.parse_worksheets()
-                dashboards = parser.parse_dashboards()
-                calculated_fields = parser.parse_calculated_fields()
-                parameters = parser.parse_parameters()
-                data_sources = parser.parse_data_sources()
+                # Get counts from model
+                worksheets = model.get("worksheets", [])
+                dashboards = model.get("dashboards", [])
+                # Filter columns for those that are calculations
+                calculated_fields = [c for c in model.get("columns", []) if c.get("formula")]
+                parameters = model.get("parameters", [])
+                data_sources = model.get("connections", [])
 
-                # Get table names (no profiling yet)
-                table_names = []
-                if parser.hyper_files:
-                    try:
-                        profiler = HyperDataProfiler(str(parser.hyper_files[0]))
-                        table_names = profiler.list_tables()
-                    except Exception as e:
-                        logger.warning(f"Could not list tables: {e}")
+                # Get table names (if profiled during discovery)
+                table_names = [t.get("name") for t in model.get("tables", [])]
+                clean_table_names = [t.get("display_name") or t.get("name") for t in model.get("tables", [])]
 
                 workbooks_summary.append({
                     "workbook_id": workbook.workbook_id,
@@ -82,10 +80,7 @@ async def get_workbook_metadata_summary(migration_id: str):
                     "parameter_count": len(parameters),
                     "data_source_count": len(data_sources),
                     "table_count": len(table_names),
-                    # Gap 6: provide clean display names alongside raw internal names
-                    "table_names": [
-                        profiler.get_clean_table_name(t) for t in table_names
-                    ] if table_names else [],
+                    "table_names": clean_table_names,
                     "table_names_raw": table_names
                 })
 
@@ -122,45 +117,45 @@ async def get_workbook_worksheets(migration_id: str, workbook_id: str):
         if not workbook:
             raise HTTPException(status_code=404, detail="Workbook not found")
 
-        parser = TableauTWBParser(workbook.file_path)
-        worksheets_raw = parser.parse_worksheets()
+        model = workbook.raw_model or {}
+        worksheets_raw = model.get("worksheets", [])
 
-        calculated_fields_raw = parser.parse_calculated_fields()
-        calc_map = {cf.name: cf for cf in calculated_fields_raw}
+        # Map unique calculations for resolution
+        calc_map = {c.get("internal_name"): c for c in model.get("columns", []) if c.get("formula")}
 
         worksheets = []
         for ws in worksheets_raw:
             # Resolve measures
             resolved_measures = []
-            for m in ws.measures:
-                if m in calc_map:
-                    cf = calc_map[m]
+            # In new model, ws['measures'] might be more structured or a list of field names
+            # Adjust based on tableau_extractor output
+            ws_measures = ws.get("measures", [])
+            for m in ws_measures:
+                m_name = m.get("name") if isinstance(m, dict) else m
+                if m_name in calc_map:
+                    cf = calc_map[m_name]
                     resolved_measures.append({
                         "type": "calculated",
-                        "name": cf.caption or cf.name,
-                        "formula": cf.formula
+                        "name": cf.get("caption") or cf.get("internal_name"),
+                        "formula": cf.get("formula")
                     })
                 else:
                     resolved_measures.append({
                         "type": "base_measure",
-                        "name": m
+                        "name": m_name
                     })
 
             worksheets.append({
-                "worksheet_name": str(ws.name) if ws.name else "",
-                "chart_type": str(ws.visual_type.value) if ws.visual_type else "Automatic",
-                "intro_chart_type": str(ws.visual_type.value) if ws.visual_type else "Automatic", # for UI consistent naming
-                "axes": ws.axes,
-                "dimensions": ws.dimensions,
+                "worksheet_name": ws.get("name", ""),
+                "chart_type": ws.get("mark_type", "Automatic"),
+                "axes": ws.get("axes", {}), # In new model it might be combined
+                "dimensions": ws.get("dimensions", []),
                 "measures": resolved_measures,
-                # Legacy fields
-                "name": str(ws.name) if ws.name else "",
-                "visual_type": str(ws.visual_type.value) if ws.visual_type else "",
-                "mark_type": str(ws.mark_type) if ws.mark_type else "",
-                "rows_fields": [str(f) for f in ws.rows_fields] if ws.rows_fields else [],
-                "columns_fields": [str(f) for f in ws.columns_fields] if ws.columns_fields else [],
-                "marks_fields": [str(f) for f in ws.marks_fields] if ws.marks_fields else [],
-                "filters": [str(f) for f in ws.filters] if ws.filters else []
+                "name": ws.get("name", ""),
+                "visual_type": ws.get("mark_type", ""),
+                "rows_fields": ws.get("rows", []),
+                "columns_fields": ws.get("cols", []),
+                "filters": [f.get("field") for f in ws.get("filters", [])]
             })
 
         return {
@@ -187,27 +182,19 @@ async def get_workbook_calculated_fields(migration_id: str, workbook_id: str):
         if not workbook:
             raise HTTPException(status_code=404, detail="Workbook not found")
 
-        parser = TableauTWBParser(workbook.file_path)
-        calculated_fields_raw = parser.parse_calculated_fields()
-
-        # Deduplicate
-        seen_calc_names = set()
-        unique_calculated_fields = []
-        for cf in calculated_fields_raw:
-            if cf.name not in seen_calc_names:
-                seen_calc_names.add(cf.name)
-                unique_calculated_fields.append(cf)
+        model = workbook.raw_model or {}
+        calculated_fields_raw = [c for c in model.get("columns", []) if c.get("formula")]
 
         calculated_fields = [
             {
-                "name": str(cf.name) if cf.name else "",
-                "formula": str(cf.formula) if cf.formula else "",
-                "calc_type": str(cf.calc_type) if cf.calc_type else "",
-                "datatype": str(cf.datatype) if cf.datatype else "",
-                "role": str(cf.role) if cf.role else "",
-                "caption": str(cf.caption) if cf.caption else None
+                "name": cf.get("internal_name", ""),
+                "formula": cf.get("formula", ""),
+                "calc_type": cf.get("formula_type", "standard"),
+                "datatype": cf.get("datatype", ""),
+                "role": cf.get("role", ""),
+                "caption": cf.get("caption")
             }
-            for cf in unique_calculated_fields
+            for cf in calculated_fields_raw
         ]
 
         return {
@@ -236,12 +223,27 @@ async def get_table_details(migration_id: str, workbook_id: str, table_name: str
         if not workbook:
             raise HTTPException(status_code=404, detail="Workbook not found")
 
-        parser = TableauTWBParser(workbook.file_path)
+        # Find hyper files from model or connection info
+        model = workbook.raw_model or {}
+        hyper_path = None
+        for conn in model.get("connections", []):
+            if conn.get("type") in ("hyper", "federated"):
+                if conn.get("filename"):
+                    # Check if file exists relative to workbook or extracted
+                    hyper_path = conn.get("filename")
+                    break
 
-        if not parser.hyper_files:
-            raise HTTPException(status_code=404, detail="No Hyper files found")
+        if not hyper_path:
+            # Fallback: check if we have it in the tables metadata
+            for t in model.get("tables", []):
+                if t.get("source") and ".hyper" in t.get("source"):
+                    hyper_path = t.get("source")
+                    break
 
-        profiler = HyperDataProfiler(str(parser.hyper_files[0]))
+        if not hyper_path:
+            raise HTTPException(status_code=404, detail="No Hyper files paths found in metadata")
+
+        profiler = HyperDataProfiler(hyper_path)
 
         # Profile just this one table
         table_unquoted = table_name.strip('"').replace('"."', '.')
@@ -433,152 +435,229 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
 
         for workbook in workbooks:
             try:
-                # Parse TWB file
-                parser = TableauTWBParser(workbook.file_path)
+                import json as _json
+                # ── Load raw_model (pre-parsed JSON from tableau_extractor) ──
+                model = workbook.raw_model or {}
+                if isinstance(model, str):
+                    try:
+                        model = _json.loads(model)
+                    except Exception:
+                        model = {}
 
-                # Extract calculated fields first (needed for resolving measures)
-                calculated_fields_raw = parser.parse_calculated_fields()
-                calc_map = {cf.name: cf for cf in calculated_fields_raw}
+                # ── Build caption map for calculated field resolution ──────
+                calc_map = {}
+                for col in model.get("columns", []):
+                    if col.get("formula"):
+                        internal = col.get("internal_name", "")
+                        caption = col.get("caption", internal)
+                        calc_map[internal] = col
 
-                # Extract worksheets
-                worksheets_raw = parser.parse_worksheets()
-
+                # ── Worksheets ─────────────────────────────────────────────
+                worksheets_raw = model.get("worksheets", [])
                 worksheets = []
+                # Build lookup sets for quick field matching
+                # key = caption (display name), value = full column dict
+                calc_by_caption = {}
+                calc_by_internal = {}
+                for col in model.get("columns", []):
+                    if not col.get("formula"):
+                        continue
+                    internal = col.get("internal_name", "")
+                    caption  = col.get("caption") or internal
+                    calc_by_caption[caption]  = col
+                    calc_by_internal[internal] = col
+
+                def _classify_field(raw_name: str):
+                    """
+                    Given a field name as it appears on a shelf (e.g. '[Brokage new]',
+                    'SUM([Cross sell bugdet])'), strip brackets/aggregation and look up
+                    in calc_map.  Returns (display_name, col_dict_or_None).
+                    """
+                    import re as _re
+                    # Strip aggregation prefix e.g. SUM([...]) → ...
+                    m = _re.search(r'\[([^\]]+)\]', raw_name)
+                    name = m.group(1) if m else raw_name.strip("[] ")
+                    # Try caption lookup first (most common after extractor resolution)
+                    col = calc_by_caption.get(name) or calc_by_internal.get(name)
+                    return name, col
+
                 for ws in worksheets_raw:
-                    # Resolve measures
-                    resolved_measures = []
-                    for m in ws.measures:
-                        if m in calc_map:
-                            cf = calc_map[m]
+                    ws_name   = ws.get("name", "")
+                    mark_type = ws.get("mark_type", "")
+
+                    # Collect every field reference on this worksheet's shelves
+                    all_shelf_fields = []
+                    # rows / cols shelves (list of strings like "SUM([Field])")
+                    all_shelf_fields += ws.get("rows", [])
+                    all_shelf_fields += ws.get("cols", [])
+                    # pane encodings (list of dicts {pane_id, encodings:{color:..., size:...}})
+                    for pane in ws.get("pane_encodings", []):
+                        all_shelf_fields += list(pane.get("encodings", {}).values())
+                    # window_cards / dashboard_cards
+                    all_shelf_fields += list(ws.get("window_cards", {}).values())
+                    all_shelf_fields += list(ws.get("dashboard_cards", {}).values())
+                    # filter fields (list of dicts with 'field' key)
+                    for f in ws.get("filters", []):
+                        fld = f.get("field") if isinstance(f, dict) else f
+                        if fld:
+                            all_shelf_fields.append(fld)
+
+                    # Deduplicate while preserving order
+                    seen_fields = set()
+                    resolved_measures   = []  # {type, name, formula?}
+                    resolved_dimensions = []  # list of display names
+                    ws_calculated_fields = [] # full calc field objects for this worksheet
+
+                    for raw in all_shelf_fields:
+                        if not raw:
+                            continue
+                        display_name, col = _classify_field(str(raw))
+                        if display_name in seen_fields:
+                            continue
+                        seen_fields.add(display_name)
+
+                        if col:
+                            # It's a calculated field
                             resolved_measures.append({
-                                "type": "calculated",
-                                "name": cf.caption or cf.name,
-                                "formula": cf.formula
+                                "type":    "calculated",
+                                "name":    col.get("caption") or display_name,
+                                "formula": col.get("formula", "")
+                            })
+                            ws_calculated_fields.append({
+                                "name":      col.get("caption") or display_name,
+                                "formula":   col.get("formula", ""),
+                                "calc_type": col.get("formula_type", ""),
+                                "datatype":  col.get("datatype", ""),
+                                "role":      col.get("role", ""),
                             })
                         else:
+                            # Base field — treat as dimension (could also be base measure,
+                            # frontend won't filter on it anyway)
+                            resolved_dimensions.append(display_name)
                             resolved_measures.append({
                                 "type": "base_measure",
-                                "name": m
+                                "name": display_name
                             })
 
+                    # Deduplicate dimensions list
+                    unique_dimensions = list(dict.fromkeys(resolved_dimensions))
+
                     worksheets.append({
-                        "worksheet_name": str(ws.name) if ws.name else "",
-                        "chart_type": str(ws.visual_type.value) if ws.visual_type else "Automatic",
-                        "axes": ws.axes,
-                        "dimensions": ws.dimensions,
-                        "measures": resolved_measures,
-                        # Legacy fields
-                        "name": str(ws.name) if ws.name else "",
-                        "visual_type": str(ws.visual_type.value) if ws.visual_type else "",
-                        "mark_type": str(ws.mark_type) if ws.mark_type else "",
-                        "rows_fields": [str(f) for f in ws.rows_fields] if ws.rows_fields else [],
-                        "columns_fields": [str(f) for f in ws.columns_fields] if ws.columns_fields else [],
-                        "marks_fields": [str(f) for f in ws.marks_fields] if ws.marks_fields else [],
-                        "filters": [str(f) for f in ws.filters] if ws.filters else []
+                        "worksheet_name":    ws_name,
+                        "chart_type":        mark_type or "Automatic",
+                        "axes":              ws.get("axes", {}),
+                        "dimensions":        unique_dimensions,
+                        "measures":          resolved_measures,
+                        "calculated_fields": ws_calculated_fields,
+                        # Legacy fields kept for frontend compatibility
+                        "name":              ws_name,
+                        "visual_type":       mark_type,
+                        "mark_type":         mark_type,
+                        "rows_fields":       ws.get("rows", []),
+                        "columns_fields":    ws.get("cols", []),
+                        "marks_fields":      ws.get("marks_fields", []),
+                        "filters":           ws.get("filters", [])
                     })
-                
-                # Extract dashboards
-                dashboards_raw = parser.parse_dashboards()
+
+                # ── Dashboards ─────────────────────────────────────────────
+                dashboards_raw = model.get("dashboards", [])
                 dashboards = [
                     {
-                        "name": str(db.name) if db.name else "",
-                        "worksheets_included": [str(w) for w in db.worksheets] if db.worksheets else []
+                        "name": str(db.get("name", "")) if isinstance(db, dict) else str(db),
+                        "worksheets_included": db.get("worksheets", []) if isinstance(db, dict) else []
                     }
                     for db in dashboards_raw
                 ]
 
-                # Deduplicate calculated fields by name (same field often appears in multiple data sources)
+                # ── Calculated Fields (columns with formula, deduplicated) ─
                 seen_calc_names = set()
-                unique_calculated_fields = []
-                for cf in calculated_fields_raw:
-                    if cf.name not in seen_calc_names:
-                        seen_calc_names.add(cf.name)
-                        unique_calculated_fields.append(cf)
+                calculated_fields = []
+                for col in model.get("columns", []):
+                    if not col.get("formula"):
+                        continue
+                    name = col.get("internal_name", "")
+                    if name in seen_calc_names:
+                        continue
+                    seen_calc_names.add(name)
+                    calculated_fields.append({
+                        "name": name,
+                        "formula": col.get("formula", ""),
+                        "calc_type": col.get("formula_type", ""),
+                        "datatype": col.get("datatype", ""),
+                        "role": col.get("role", ""),
+                        "caption": col.get("caption") or None
+                    })
 
-                logger.info(f"Found {len(calculated_fields_raw)} calculated fields, {len(unique_calculated_fields)} unique")
+                logger.info(f"Found {len(calculated_fields)} unique calculated fields from raw_model")
 
-                calculated_fields = [
-                    {
-                        "name": str(cf.name) if cf.name else "",
-                        "formula": str(cf.formula) if cf.formula else "",
-                        "calc_type": str(cf.calc_type) if cf.calc_type else "",
-                        "datatype": str(cf.datatype) if cf.datatype else "",
-                        "role": str(cf.role) if cf.role else "",
-                        "caption": str(cf.caption) if cf.caption else None
-                    }
-                    for cf in unique_calculated_fields
-                ]
-
-                # Extract LOD expressions
-                lod_expressions_raw = parser.parse_lod_expressions()
+                # ── LOD Expressions ────────────────────────────────────────
                 lod_expressions = [
                     {
-                        "name": str(lod.name) if lod.name else "",
-                        "lod_type": str(lod.lod_type) if lod.lod_type else "",
-                        "dimensions": [str(d) for d in lod.dimensions] if lod.dimensions else [],
-                        "aggregation": str(lod.aggregation) if lod.aggregation else "",
-                        "formula": str(lod.formula) if lod.formula else ""
+                        "name": lod.get("caption", ""),
+                        "lod_type": lod.get("lod_type", ""),
+                        "dimensions": [],
+                        "aggregation": "",
+                        "formula": lod.get("formula", "")
                     }
-                    for lod in lod_expressions_raw
+                    for lod in model.get("lod_calculations", [])
                 ]
 
-                # Extract parameters
-                parameters_raw = parser.parse_parameters()
+                # ── Parameters ─────────────────────────────────────────────
                 parameters = [
                     {
-                        "name": str(param.name) if param.name else "",
-                        "datatype": str(param.datatype) if param.datatype else "",
-                        "current_value": str(param.current_value) if param.current_value else "",
-                        "allowable_values": [str(v) for v in param.allowable_values] if param.allowable_values else [],
-                        "alias": str(param.alias) if param.alias else None
+                        "name": p.get("name", ""),
+                        "datatype": p.get("datatype", ""),
+                        "current_value": str(p.get("current_value", "")),
+                        "allowable_values": [
+                            v.get("value", v) if isinstance(v, dict) else str(v)
+                            for v in p.get("allowable_values", [])
+                        ],
+                        "alias": p.get("alias") or None
                     }
-                    for param in parameters_raw
+                    for p in model.get("parameters", [])
                 ]
 
-                # Extract data sources
-                data_sources_raw = parser.parse_data_sources()
-                data_sources = []
-
-                # Profile tables ONCE per workbook (not per data source)
-                # All data sources in a workbook typically share the same Hyper extract
+                # ── Hyper Table Profiling ──────────────────────────────────
                 workbook_tables = []
-                hyper_files = parser.hyper_files
+                hyper_path_str = None
 
-                if hyper_files and len(hyper_files) > 0:
-                    hyper_path = hyper_files[0]  # Use first Hyper file
-                    hyper_path_str = str(hyper_path)
+                # Primary: hyper_files list stored by migration orchestrator in Phase 1
+                hyper_files_list = model.get("hyper_files", [])
+                for hf in hyper_files_list:
+                    if hf and str(hf).endswith(".hyper"):
+                        hyper_path_str = str(hf)
+                        break
 
+                # Fallback: old connections-based lookup
+                if not hyper_path_str:
+                    for conn in model.get("connections", []):
+                        if conn.get("type") in ("hyper", "federated") and conn.get("filename"):
+                            hyper_path_str = conn.get("filename")
+                            break
+
+                logger.info(f"Hyper path resolved: {hyper_path_str}")
+
+                if hyper_path_str:
                     try:
                         logger.info(f"Profiling Hyper file once for workbook: {hyper_path_str}")
                         profiler = HyperDataProfiler(hyper_path_str)
                         tables = profiler.list_tables()
-
                         logger.info(f"Found {len(tables)} tables to profile: {tables}")
 
                         for table in tables:
                             try:
-                                # Strip quotes from table name for profiling
                                 table_unquoted = table.strip('"').replace('"."', '.')
-
                                 logger.info(f"Profiling table: {table} (unquoted: {table_unquoted})")
-
-                                # Profile the table
                                 table_profile = profiler.profile_table(table_unquoted, sample_size=100)
-
-                                # Get row count and data preview
                                 df = profiler.read_table(table_unquoted, limit=10)
                                 row_count = table_profile.row_count
                                 total_rows += row_count
 
-                                # Get data preview (10 rows) and convert to JSON-safe format
-                                data_preview_raw = df.to_dict('records')
-
-                                # Ensure all values are JSON-serializable
+                                # JSON-safe data preview
                                 data_preview = []
-                                for row in data_preview_raw:
+                                for row in df.to_dict('records'):
                                     clean_row = {}
                                     for key, value in row.items():
-                                        # Convert pandas types to Python types
                                         if pd.isna(value):
                                             clean_row[str(key)] = None
                                         elif isinstance(value, (pd.Timestamp, pd.DatetimeTZDtype)):
@@ -589,10 +668,8 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                                             clean_row[str(key)] = str(value)
                                     data_preview.append(clean_row)
 
-                                # Extract column info from TableProfile
                                 columns_info = []
                                 for col_profile in table_profile.columns:
-                                    # Map pandas dtype to SQL type
                                     data_type = str(col_profile.data_type).upper()
                                     if 'INT' in data_type:
                                         data_type = 'INTEGER'
@@ -604,63 +681,65 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                                         data_type = 'BOOLEAN'
                                     elif 'DATETIME' in data_type or 'DATE' in data_type:
                                         data_type = 'DATE'
-
                                     columns_info.append({
                                         "name": str(col_profile.column_name),
                                         "data_type": str(data_type),
                                         "nullable": bool(col_profile.null_count > 0)
                                     })
 
-                                # Gap 6: add clean display_name to table_detail
                                 display_name = profiler.get_clean_table_name(table)
-                                table_detail = {
-                                    "table_name": str(table),       # raw internal name
-                                    "display_name": display_name,    # human-readable name
+                                workbook_tables.append({
+                                    "table_name": str(table),
+                                    "display_name": display_name,
                                     "row_count": int(row_count),
                                     "columns": columns_info,
-                                    "column_details": columns_info,  # Frontend expects this field name
+                                    "column_details": columns_info,
                                     "data_preview": data_preview
-                                }
-
-                                workbook_tables.append(table_detail)
+                                })
                                 total_tables += 1
-
                                 logger.info(f"Successfully profiled table {table} with {len(columns_info)} columns")
 
                             except Exception as table_error:
                                 logger.error(f"Failed to profile individual table {table}: {table_error}", exc_info=True)
-                                # Continue to next table
 
                     except Exception as e:
                         logger.error(f"Failed to initialize Hyper profiler: {e}", exc_info=True)
-                        # Continue without data details
 
-                # Now process each data source (just metadata, not table profiling)
-                for ds in data_sources_raw:
-                    # Collect all field names from workbook tables
-                    all_fields = set()
-                    for table in workbook_tables:
-                        for col in table['columns']:
-                            all_fields.add(col['name'])
+                # ── Data Sources ───────────────────────────────────────────
+                data_sources = []
+                raw_datasources = model.get("datasources", []) or model.get("data_sources", [])
+                all_fields = set()
+                for table in workbook_tables:
+                    for col in table['columns']:
+                        all_fields.add(col['name'])
 
-                    data_source = {
-                        "name": str(ds.name) if ds.name else "",
-                        "connection_type": str(ds.connection_type) if ds.connection_type else "",
-                        "tables": [str(t) for t in ds.tables] if ds.tables else [],
-                        "fields": sorted(list(all_fields)),  # All column names
-                        "table_details": workbook_tables  # Reference workbook-level tables
-                    }
+                if raw_datasources:
+                    for ds in raw_datasources:
+                        data_sources.append({
+                            "name": str(ds.get("name", "")) if isinstance(ds, dict) else str(ds),
+                            "connection_type": str(ds.get("connection_type", "")) if isinstance(ds, dict) else "",
+                            "tables": ds.get("tables", []) if isinstance(ds, dict) else [],
+                            "fields": sorted(list(all_fields)),
+                            "table_details": workbook_tables
+                        })
+                else:
+                    # Fallback: synthesize one data source entry from connection info
+                    for conn in model.get("connections", []):
+                        data_sources.append({
+                            "name": conn.get("caption", "Tableau Data Source"),
+                            "connection_type": conn.get("type", ""),
+                            "tables": [],
+                            "fields": sorted(list(all_fields)),
+                            "table_details": workbook_tables
+                        })
 
-                    data_sources.append(data_source)
-
-                # Update counters
+                # ── Counters ───────────────────────────────────────────────
                 total_worksheets += len(worksheets)
                 total_dashboards += len(dashboards)
                 total_calculated_fields += len(calculated_fields)
                 total_parameters += len(parameters)
                 total_data_sources += len(data_sources)
 
-                # Build workbook metadata (ensure all values are JSON-serializable)
                 workbook_metadata = {
                     "workbook_id": str(workbook.workbook_id),
                     "filename": str(workbook.filename),
@@ -681,6 +760,9 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                     status_code=500,
                     detail=f"Failed to parse workbook: {str(e)}"
                 )
+
+
+
 
         # Return comprehensive metadata
         return {
@@ -922,25 +1004,27 @@ async def create_tableau_preview(
 
         # Use first workbook (assuming single workbook migration for now)
         workbook = workbooks[0]
-        twbx_path = Path(workbook.file_path)
 
-        # Parse workbook to get Hyper files (parsing happens in __init__)
-        parser = TableauTWBParser(twbx_path)
+        # Find Hyper file path from raw_model (pre-parsed during discovery)
+        model = workbook.raw_model or {}
+        hyper_path = None
+        for conn in model.get("connections", []):
+            if conn.get("type") in ("hyper", "federated") and conn.get("filename"):
+                hyper_path = conn.get("filename")
+                break
 
-        if not parser.hyper_files or len(parser.hyper_files) == 0:
+        if not hyper_path:
             raise HTTPException(
                 status_code=404,
                 detail={
                     "error": {
                         "code": "NO_HYPER_FILES_FOUND",
-                        "message": "No Hyper data files found in workbook",
+                        "message": "No Hyper data files found in workbook metadata",
                         "details": {"workbook": workbook.filename}
                     }
                 }
             )
 
-        # Use first Hyper file
-        hyper_path = parser.hyper_files[0]
         logger.info(f"Reading tables from Hyper file: {hyper_path}")
 
         # Read selected tables as DataFrames using HyperDataProfiler
@@ -1083,19 +1167,8 @@ async def create_tableau_preview(
 @router.get("/{migration_id}/workbook-metadata/model-intelligence")
 async def get_model_intelligence(migration_id: str):
     """
-    OPTIMIZED: Single endpoint that returns all Page 2 metadata in one call.
-
-    Profiles each table ONCE and returns:
-    - Table data (columns, row counts, preview)
-    - Classifications (FACT/DIMENSION)
-    - Data quality (duplicates, status)
-    - Primary key detection
-
-    This eliminates redundant profiling across multiple endpoints.
-
-    Performance:
-    - Before: 3 separate endpoints × 10-15 sec each = 28-43 sec total
-    - After: 1 combined endpoint = 10-15 sec (65% faster!)
+    Returns Page 2 table metadata: classifications, quality, column details.
+    Reads Hyper files from raw_model['hyper_files'] (set by orchestrator Phase 1).
     """
     try:
         migration = migration_store.get_migration(migration_id)
@@ -1117,113 +1190,88 @@ async def get_model_intelligence(migration_id: str):
         }
 
         for workbook in workbooks:
-            # Parse TWBX to extract Hyper file
-            if not (workbook.file_path and workbook.file_path.endswith('.twbx')):
-                logger.warning(f"Skipping non-TWBX workbook: {workbook.filename}")
+            model = workbook.raw_model or {}
+            hyper_files = model.get("hyper_files", [])
+
+            if not hyper_files:
+                logger.warning(f"No hyper_files in raw_model for {workbook.filename}")
                 continue
 
-            from src.tableau.twb_parser import TableauTWBParser
-
-            parser = TableauTWBParser(workbook.file_path)
-            if not parser.hyper_files:
-                logger.warning(f"No Hyper files found in {workbook.filename}")
-                continue
-
-            hyper_path = str(parser.hyper_files[0])
-            profiler = HyperDataProfiler(hyper_path)
-            tables = profiler.list_tables()
-
-            # Profile each table ONCE and extract all needed data
-            for table in tables:
-                table_unquoted = str(table).strip('"').replace('".\"', '.')
-
-                try:
-                    # Single comprehensive profile call
-                    profile = profiler.profile_table(table_unquoted, sample_size=10000)
-
-                    # Extract metrics from profile
-                    row_count = profile.row_count
-                    columns = profile.columns
-                    numeric_cols = [c for c in columns if c.data_type in ['int64', 'float64']]
-
-                    # Classification logic (FACT vs DIMENSION)
-                    numeric_density = len(numeric_cols) / len(columns) if columns else 0
-                    if row_count > 100000 and numeric_density > 0.5:
-                        classification = "FACT"
-                        confidence = 95
-                        reasoning = f"High numeric density ({len(numeric_cols)} columns) and large row count indicate fact table"
-                    elif row_count < 10000 and numeric_density < 0.3:
-                        classification = "DIMENSION"
-                        confidence = 98
-                        reasoning = f"Low numeric density ({len(numeric_cols)} columns) and small row count indicate dimension table"
-                    else:
-                        classification = "DIMENSION"
-                        confidence = 70
-                        reasoning = f"Mixed characteristics (rows: {row_count}, numeric cols: {len(numeric_cols)}) - likely dimension"
-
-                    # Data quality metrics
-                    duplicate_count = profiler.detect_duplicates(table_unquoted, sample_size=10000)
-                    duplicate_rate = (duplicate_count / row_count * 100) if row_count > 0 else 0
-                    quality_status = "good" if duplicate_rate < 1 else "warning"
-
-                    # Primary key detection (column with 99%+ uniqueness)
-                    pk_column = None
-                    pk_uniqueness = 0
-                    for col in columns:
-                        if col.cardinality >= 0.99:
-                            pk_column = str(col.column_name)
-                            pk_uniqueness = round(col.cardinality * 100, 1)
-                            break
-
-                    # Column details
-                    column_details = [{
-                        "name": str(col.column_name),
-                        "data_type": str(col.data_type),
-                        "nullable": col.null_count > 0,
-                        "cardinality": round(col.cardinality * 100, 1) if hasattr(col, 'cardinality') else 0
-                    } for col in columns]
-
-                    # Build comprehensive table metadata
-                    table_metadata = {
-                        "table_name": str(table),
-                        "row_count": row_count,
-                        "column_count": len(columns),
-                        "column_details": column_details,
-
-                        # Classification data
-                        "classification": classification,
-                        "confidence_score": confidence,
-                        "numeric_columns": len(numeric_cols),
-                        "reasoning": reasoning,
-
-                        # Quality data
-                        "duplicate_count": duplicate_count,
-                        "duplicate_rate": round(duplicate_rate, 2),
-                        "status": quality_status,
-
-                        # Primary key data
-                        "potential_primary_key": pk_column,
-                        "pk_uniqueness": pk_uniqueness
-                    }
-
-                    result["tables"].append(table_metadata)
-
-                    # Update summary stats
-                    result["summary"]["total_rows"] += row_count
-                    if classification == "FACT":
-                        result["summary"]["fact_tables"] += 1
-                    else:
-                        result["summary"]["dimension_tables"] += 1
-
-                    logger.info(f"Profiled table '{table}' - {classification} ({confidence}% confidence)")
-
-                except Exception as table_error:
-                    logger.error(f"Failed to profile table {table}: {table_error}")
-                    # Continue with next table instead of failing entirely
+            for hyper_path in hyper_files:
+                if not hyper_path or not str(hyper_path).endswith(".hyper"):
                     continue
 
-            result["summary"]["total_tables"] = len(result["tables"])
+                profiler = HyperDataProfiler(str(hyper_path))
+                tables = profiler.list_tables()
 
+                for table in tables:
+                    table_unquoted = str(table).strip('"').replace('"."', '.')
+                    clean_name = profiler.get_clean_table_name(table)
+
+                    try:
+                        profile = profiler.profile_table(table_unquoted, sample_size=10000)
+                        row_count = profile.row_count
+                        columns = profile.columns
+                        numeric_cols = [c for c in columns if c.data_type in ["int64", "float64"]]
+                        numeric_density = len(numeric_cols) / len(columns) if columns else 0
+
+                        if row_count > 100000 and numeric_density > 0.5:
+                            classification, confidence = "FACT", 95
+                            reasoning = f"High numeric density ({len(numeric_cols)} cols) and large row count"
+                        elif row_count < 10000 and numeric_density < 0.3:
+                            classification, confidence = "DIMENSION", 98
+                            reasoning = f"Low numeric density ({len(numeric_cols)} cols) and small row count"
+                        else:
+                            classification, confidence = "DIMENSION", 70
+                            reasoning = f"Mixed (rows: {row_count}, numeric: {len(numeric_cols)})"
+
+                        duplicate_count = profiler.detect_duplicates(table_unquoted, sample_size=10000)
+                        duplicate_rate = (duplicate_count / row_count * 100) if row_count > 0 else 0
+                        quality_status = "good" if duplicate_rate < 1 else "warning"
+
+                        pk_column, pk_uniqueness = None, 0
+                        for col in columns:
+                            if col.cardinality >= 0.99:
+                                pk_column = str(col.column_name)
+                                pk_uniqueness = round(col.cardinality * 100, 1)
+                                break
+
+                        column_details = [{
+                            "name": str(col.column_name),
+                            "data_type": str(col.data_type),
+                            "nullable": col.null_count > 0,
+                            "cardinality": round(col.cardinality * 100, 1) if hasattr(col, "cardinality") else 0
+                        } for col in columns]
+
+                        result["tables"].append({
+                            "table_name": clean_name,
+                            "row_count": row_count,
+                            "column_count": len(columns),
+                            "column_details": column_details,
+                            "classification": classification,
+                            "confidence_score": confidence,
+                            "numeric_columns": len(numeric_cols),
+                            "reasoning": reasoning,
+                            "duplicate_count": duplicate_count,
+                            "duplicate_rate": round(duplicate_rate, 2),
+                            "status": quality_status,
+                            "potential_primary_key": pk_column,
+                            "pk_uniqueness": pk_uniqueness
+                        })
+
+                        result["summary"]["total_rows"] += row_count
+                        if classification == "FACT":
+                            result["summary"]["fact_tables"] += 1
+                        else:
+                            result["summary"]["dimension_tables"] += 1
+
+                        logger.info(f"Profiled '{clean_name}' - {classification} ({confidence}%)")
+
+                    except Exception as table_error:
+                        logger.error(f"Failed to profile table {table}: {table_error}")
+                        continue
+
+        result["summary"]["total_tables"] = len(result["tables"])
         return result
 
     except HTTPException:
@@ -1232,11 +1280,5 @@ async def get_model_intelligence(migration_id: str):
         logger.error(f"Failed to get model intelligence: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail={
-                "error": {
-                    "code": "MODEL_INTELLIGENCE_FAILED",
-                    "message": "Failed to retrieve model intelligence",
-                    "details": str(e)
-                }
-            }
+            detail={"error": {"code": "MODEL_INTELLIGENCE_FAILED", "message": str(e)}}
         )

@@ -118,6 +118,7 @@ class TableauWorkbook:
     data_source_count: int = 0
     file_path: Optional[str] = None
     extracted_at: Optional[datetime] = None
+    raw_model: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_db_row(cls, row) -> "TableauWorkbook":
@@ -125,15 +126,19 @@ class TableauWorkbook:
         if row is None:
             return None
 
+        import json
+        raw_model_str = row["raw_model"] if isinstance(row, dict) else (row[4] if len(row) > 8 else None) # Assuming inserted at pos 4
+
         return cls(
             workbook_id=row["workbook_id"] if isinstance(row, dict) else row[0],
             migration_id=row["migration_id"] if isinstance(row, dict) else row[1],
             filename=row["filename"] if isinstance(row, dict) else row[2],
             file_path=row["file_path"] if isinstance(row, dict) else row[3],
-            worksheet_count=row["worksheet_count"] if isinstance(row, dict) else (row[4] or 0),
-            dashboard_count=row["dashboard_count"] if isinstance(row, dict) else (row[5] or 0),
-            data_source_count=row["data_source_count"] if isinstance(row, dict) else (row[6] or 0),
-            extracted_at=datetime.fromisoformat(row["extracted_at"]) if (row["extracted_at"] if isinstance(row, dict) else row[7]) and isinstance((row["extracted_at"] if isinstance(row, dict) else row[7]), str) else (row["extracted_at"] if isinstance(row, dict) else row[7]),
+            raw_model=json.loads(raw_model_str) if raw_model_str else None,
+            worksheet_count=row["worksheet_count"] if isinstance(row, dict) else (row[5] if len(row) > 8 else (row[4] or 0)),
+            dashboard_count=row["dashboard_count"] if isinstance(row, dict) else (row[6] if len(row) > 8 else (row[5] or 0)),
+            data_source_count=row["data_source_count"] if isinstance(row, dict) else (row[7] if len(row) > 8 else (row[6] or 0)),
+            extracted_at=datetime.fromisoformat(row["extracted_at"]) if (row["extracted_at"] if isinstance(row, dict) else (row[8] if len(row) > 8 else row[7])) and isinstance((row["extracted_at"] if isinstance(row, dict) else (row[8] if len(row) > 8 else row[7])), str) else (row["extracted_at"] if isinstance(row, dict) else (row[8] if len(row) > 8 else row[7])),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -143,6 +148,7 @@ class TableauWorkbook:
             "migration_id": self.migration_id,
             "filename": self.filename,
             "file_path": self.file_path,
+            "raw_model": self.raw_model,
             "worksheet_count": self.worksheet_count,
             "dashboard_count": self.dashboard_count,
             "data_source_count": self.data_source_count,
@@ -164,6 +170,12 @@ class TableauCalculation:
     depends_on: Optional[List[str]] = None
     depends_on_metadata: Optional[Dict[str, Dict[str, Any]]] = None
     created_at: Optional[datetime] = None
+    
+    # NEW FIELDS: Native Truth from tableau_extractor JSON
+    is_lod: bool = False
+    is_table_calc: bool = False
+    used_in_tooltips: Optional[List[str]] = None
+    used_in_filters: Optional[List[str]] = None
 
     @classmethod
     def from_db_row(cls, row) -> "TableauCalculation":
@@ -173,9 +185,11 @@ class TableauCalculation:
 
         import json
         visual_context_str = row["visual_context"] if isinstance(row, dict) else row[5]
-        used_in_str = row["used_in_worksheets"] if isinstance(row, dict) else row[6]
-        depends_on_str = row["depends_on"] if isinstance(row, dict) else row[8]
-        depends_on_metadata_str = row["depends_on_metadata"] if isinstance(row, dict) else row[9]
+        used_in_str = row["used_in_worksheets"] if isinstance(row, dict) else row[9]
+        depends_on_str = row["depends_on"] if isinstance(row, dict) else row[7]
+        depends_on_metadata_str = row["depends_on_metadata"] if isinstance(row, dict) else row[8]
+        
+        visual_context_json = json.loads(visual_context_str) if visual_context_str else None
 
         return cls(
             calc_id=row["calc_id"] if isinstance(row, dict) else row[0],
@@ -183,12 +197,17 @@ class TableauCalculation:
             calc_name=row["calc_name"] if isinstance(row, dict) else row[2],
             calc_formula=row["calc_formula"] if isinstance(row, dict) else row[3],
             calc_type=CalculationType(row["calc_type"] if isinstance(row, dict) else row[4]),
-            visual_context=json.loads(visual_context_str) if visual_context_str else None,
-            dependency_level=row["dependency_level"] if isinstance(row, dict) else (row[7] or 0),
+            visual_context=visual_context_json,
+            dependency_level=row["dependency_level"] if isinstance(row, dict) else (row[6] or 0),
             used_in_worksheets=used_in_str.split(",") if used_in_str else None,
             depends_on=json.loads(depends_on_str) if depends_on_str else None,
             depends_on_metadata=json.loads(depends_on_metadata_str) if depends_on_metadata_str else None,
             created_at=datetime.fromisoformat(row["created_at"]) if (row["created_at"] if isinstance(row, dict) else row[10]) and isinstance((row["created_at"] if isinstance(row, dict) else row[10]), str) else (row["created_at"] if isinstance(row, dict) else row[10]),
+            # Extract new truth parameters from visual_context which acts as persistence wrapper
+            is_lod=visual_context_json.get("is_lod", False) if visual_context_json else False,
+            is_table_calc=visual_context_json.get("is_table_calc", False) if visual_context_json else False,
+            used_in_tooltips=visual_context_json.get("used_in_tooltips") if visual_context_json else None,
+            used_in_filters=visual_context_json.get("used_in_filters") if visual_context_json else None,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -205,6 +224,10 @@ class TableauCalculation:
             "depends_on": self.depends_on,
             "depends_on_metadata": self.depends_on_metadata,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "is_lod": self.is_lod,
+            "is_table_calc": self.is_table_calc,
+            "used_in_tooltips": self.used_in_tooltips,
+            "used_in_filters": self.used_in_filters,
         }
 
 
