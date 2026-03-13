@@ -1591,7 +1591,14 @@ async def get_suggested_relationships(migration_id: str):
         for workbook in workbooks:
             # Hyper paths are stored in raw_model['hyper_files'] (set by orchestrator Phase 1)
             raw_model = workbook.raw_model or {}
+            # Use hyper_files list for robust detection
             hyper_files = raw_model.get("hyper_files", [])
+            
+            # If hyper_files is empty, fallback to connections (legacy support)
+            if not hyper_files:
+                for conn in raw_model.get("connections", []):
+                    if conn.get("type") in ("hyper", "federated") and conn.get("filename"):
+                        hyper_files.append(conn.get("filename"))
 
             for hyper_path in hyper_files:
                 if not hyper_path or not str(hyper_path).endswith(".hyper"):

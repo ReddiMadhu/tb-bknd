@@ -1005,13 +1005,24 @@ async def create_tableau_preview(
         # Use first workbook (assuming single workbook migration for now)
         workbook = workbooks[0]
 
-        # Find Hyper file path from raw_model (pre-parsed during discovery)
+        # Find Hyper file paths from raw_model (pre-parsed during discovery)
         model = workbook.raw_model or {}
+        hyper_files = model.get("hyper_files", [])
         hyper_path = None
-        for conn in model.get("connections", []):
-            if conn.get("type") in ("hyper", "federated") and conn.get("filename"):
-                hyper_path = conn.get("filename")
-                break
+        
+        if hyper_files:
+            # Use the first valid hyper file found
+            for path in hyper_files:
+                if path and str(path).endswith(".hyper"):
+                    hyper_path = path
+                    break
+        
+        # Fallback to connections if hyper_files is empty (legacy support)
+        if not hyper_path:
+            for conn in model.get("connections", []):
+                if conn.get("type") in ("hyper", "federated") and conn.get("filename"):
+                    hyper_path = conn.get("filename")
+                    break
 
         if not hyper_path:
             raise HTTPException(
