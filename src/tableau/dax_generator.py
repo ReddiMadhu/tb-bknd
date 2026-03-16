@@ -253,12 +253,12 @@ CALCULATION TYPE: {calc_type_str} | GRANULARITY: {granularity_str}{lod_info}
 CONVERSION RULES:
 1. MEASURES (is_aggregated / CALCULATED_MEASURE): [MeasureName] — no table, no SUM()
 2. BASE NUMERIC COLUMNS: SUM('Table'[Col]) / AVG / COUNT / MIN / MAX as appropriate
-3. BASE DIMENSION COLUMNS: 'Table'[Col] inside CALCULATE/filter args — never in SUM()
+3. BASE DIMENSION COLUMNS: 'Table'[Col] inside CALCULATE filters. In IF/SWITCH conditions outside CALCULATE, MUST wrap in SELECTEDVALUE('Table'[Col]) since Measures lack row context.
 4. IF patterns:
    - IF 'Table'[col] = "val" THEN 'Table'[Amount] END → CALCULATE(SUM('Table'[Amount]), 'Table'[col] = "val")
-   - IF condition THEN [Measure] END → CALCULATE([Measure], condition)
-   - IF condition THEN "text" END → IF(condition, "text", BLANK())
-   - IF condition THEN 1 ELSE 0 END → IF(condition, 1, 0)
+   - IF 'Table'[col] = "val" THEN [Measure] END → CALCULATE([Measure], 'Table'[col] = "val")
+   - IF 'Table'[col] = "val" THEN "text" END → IF(SELECTEDVALUE('Table'[col]) = "val", "text", BLANK())
+   - IF 'Table'[col] = "val" THEN 1 ELSE 0 END → IF(SELECTEDVALUE('Table'[col]) = "val", 1, 0)
 5. Division: DIVIDE(a, b, 0) — not raw /
 6. Percentage: DIVIDE(a, b, 0) * 100
 7. LOD conversions:
