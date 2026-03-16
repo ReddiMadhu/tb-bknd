@@ -141,7 +141,7 @@ class DAXGenerator:
         source_table_map: Optional[Dict[str, str]] = None,
         known_measures: Optional[set] = None,
     ) -> DAXResult:
-        """LLM-based DAX conversion with focused prompt."""
+        """LLM-based DAX conversion with rich, structured context prompt."""
         import time
 
         source_table_map = source_table_map or {}
@@ -152,49 +152,132 @@ class DAXGenerator:
         clean_formula = re.sub(r'\[([^\]\(]+?)\s+\([^\)]+\)\]', r'[\1]', original_formula)
         print("clean_formula", clean_formula)
 
-        # Build context
+        # ── 1. Table context from source_table_map qualifier scan ──────────
         tables_info, table_refs = self._build_table_context(original_formula, source_table_map)
 
-        # Field-to-table mapping block
         if table_refs:
-            mapping_lines = [f"  {field} → {tbl}[{field}]" for field, tbl in sorted(table_refs.items())]
-            table_mapping = "\nField mappings:\n" + "\n".join(mapping_lines)
+            mapping_lines = [f"  {f} → {t}[{f}]" for f, t in sorted(table_refs.items())]
+            table_mapping = "\nField mappings (from formula qualifiers):\n" + "\n".join(mapping_lines)
         else:
             table_mapping = ""
 
-        # Known measures block
+        # ── 2. Known measures ──────────────────────────────────────────────
         if known_measures:
             measures_list = ", ".join(f"[{m}]" for m in sorted(known_measures))
-            measures_info = f"\nKnown measures (use [Name] only, no table, no SUM): {measures_list}"
+            measures_info = f"\nKnown DAX measures (reference as [Name] — NO SUM, NO table prefix): {measures_list}"
         else:
             measures_info = ""
 
+        # ── 3. Calculation type + granularity + LOD ────────────────────────
+        calc_type_str = calc_node.calc_type.value if calc_node.calc_type else "UNKNOWN"
+        granularity_str = calc_node.granularity.value if calc_node.granularity else "UNKNOWN"
+        lod_info = (f"\nLOD Type: {calc_node.lod_type}"
+                    if calc_node.is_lod and calc_node.lod_type else "")
+
+        # ── 4. Dependency metadata — exact type + aggregation state per dep ─
+        dep_lines = []
+        if calc_node.depends_on_metadata:
+            for dep_name, dep_meta in calc_node.depends_on_metadata.items():
+                ft = dep_meta.field_type       # BASE_COLUMN / CALCULATED_MEASURE / CALCULATED_COLUMN / UNKNOWN
+                role = dep_meta.original_role  # measure / dimension
+                is_agg = dep_meta.is_aggregated
+                if is_agg or ft == "CALCULATED_MEASURE":
+                    dep_lines.append(
+                        f"  [{dep_name}] → MEASURE (already aggregated — [Name] only, NO SUM, NO table prefix)"
+                    )
+                elif ft == "BASE_COLUMN" and role == "measure":
+                    phys = table_refs.get(dep_name)
+                    if not phys:
+                        st = getattr(calc_node, "source_tables", [])
+                        phys = st[0] if st else (table_name or "Table")
+                    dep_lines.append(
+                        f"  [{dep_name}] → BASE NUMERIC COLUMN in '{phys}' — use SUM({phys}[{dep_name}])"
+                    )
+                elif ft == "BASE_COLUMN":
+                    phys = table_refs.get(dep_name)
+                    if not phys:
+                        st = getattr(calc_node, "source_tables", [])
+                        phys = st[0] if st else (table_name or "Table")
+                    dep_lines.append(
+                        f"  [{dep_name}] → BASE DIMENSION COLUMN in '{phys}' — use {phys}[{dep_name}] in filter args, NOT in SUM()"
+                    )
+                elif ft == "CALCULATED_COLUMN":
+                    dep_lines.append(f"  [{dep_name}] → CALCULATED COLUMN (row-level) — use Table[Name] or as filter arg")
+                else:
+                    dep_lines.append(f"  [{dep_name}] → {ft} — review manually")
+        dep_context = ("\nDependency types (CRITICAL — determines SUM vs [Measure]):\n"
+                       + "\n".join(dep_lines)) if dep_lines else ""
+
+        # ── 5. Source tables from extractor (ground truth cols/map lookup) ─
+        src_tables = getattr(calc_node, "source_tables", [])
+        src_tables_info = (
+            "\nPhysical source table(s): " + ", ".join(src_tables)
+        ) if src_tables else ""
+
+        # ── 6. Visual context ──────────────────────────────────────────────
+        visual_lines = []
+        if calc_node.visual_context:
+            vc = calc_node.visual_context
+            if vc.used_in_worksheets:
+                visual_lines.append(f"  Worksheets: {', '.join(vc.used_in_worksheets[:5])}")
+            if vc.partition_by:
+                visual_lines.append(
+                    f"  Partitioned by: {', '.join(vc.partition_by[:5])}"
+                    " (use as ALLEXCEPT dims for FIXED LOD)"
+                )
+            if vc.visual_types:
+                visual_lines.append(f"  Visual types: {', '.join(vt.value for vt in vc.visual_types[:3])}")
+            if vc.filters and vc.filters.context_filters:
+                visual_lines.append(f"  Context filters: {', '.join(vc.filters.context_filters[:3])}")
+        visual_block = ("\nVisual context:\n" + "\n".join(visual_lines)) if visual_lines else ""
+
+        # ── 7. Pre-analyzed context transition from LogicGraphBuilder ──────
+        transition_block = ""
+        if calc_node.context_transition:
+            ct = calc_node.context_transition
+            if ct.transition_type and ct.transition_type.value != "NONE":
+                transition_block = (
+                    f"\nContext transition: {ct.transition_type.value}"
+                    f"\n  DAX pattern hint: {ct.dax_pattern}"
+                    f"\n  Explanation: {ct.explanation}"
+                )
+
+        # ── Build the prompt ───────────────────────────────────────────────
         prompt = f"""Convert Tableau formula to DAX.
 
 MEASURE NAME: {calc_node.name}
 TABLEAU FORMULA: {clean_formula}
-{tables_info}{table_mapping}{measures_info}
+CALCULATION TYPE: {calc_type_str} | GRANULARITY: {granularity_str}{lod_info}
+{tables_info}{table_mapping}{measures_info}{dep_context}{src_tables_info}{visual_block}{transition_block}
 
 CONVERSION RULES:
-1. Known measures: Reference as [MeasureName] - NO table prefix, NO SUM()
-2. Physical columns: Use Table[ColumnName] with SUM/AVG/COUNT/etc.
-3. IF patterns:
-   - IF Table[col] = "value" THEN Table[Amount] END → CALCULATE(SUM(Table[Amount]), Table[col] = "value")
-   - IF condition THEN "text" END → IF(condition, "text", BLANK())
+1. MEASURES (is_aggregated / CALCULATED_MEASURE): [MeasureName] — no table, no SUM()
+2. BASE NUMERIC COLUMNS: SUM(Table[Col]) / AVG / COUNT / MIN / MAX as appropriate
+3. BASE DIMENSION COLUMNS: Table[Col] inside CALCULATE/filter args — never in SUM()
+4. IF patterns:
+   - IF Table[col] = "val" THEN Table[Amount] END → CALCULATE(SUM(Table[Amount]), Table[col] = "val")
    - IF condition THEN [Measure] END → CALCULATE([Measure], condition)
-4. Arithmetic:
-   - Division: DIVIDE(a, b, 0) not a/b
-   - Percentage: DIVIDE(a, b, 0) * 100
-5. Fields with NO table qualifier in the Tableau formula (e.g. [Cross sell bugdet], [New Budget]) are DAX MEASURES — reference as [FieldName] with NO SUM and NO table prefix
-6. CRITICAL: Output MUST start with measure name. Format: MeasureName = <formula>
+   - IF condition THEN "text" END → IF(condition, "text", BLANK())
+   - IF condition THEN 1 ELSE 0 END → IF(condition, 1, 0)
+5. Division: DIVIDE(a, b, 0) — not raw /
+6. Percentage: DIVIDE(a, b, 0) * 100
+7. LOD conversions:
+   - FIXED [dim1, dim2]: expr → CALCULATE(expr, ALLEXCEPT(Table, Table[dim1], Table[dim2]))
+   - FIXED (no dims): expr → CALCULATE(expr, ALL(Table))
+   - EXCLUDE [dim]: expr → CALCULATE(expr, ALL(Table[dim]))
+   - INCLUDE → CALCULATE(expr, SUMMARIZE(...)) or flag: -- INCLUDE LOD: manual redesign needed
+8. Table calcs (RUNNING_SUM, RANK, INDEX etc.) → emit placeholder:
+   -- Table calc '{calc_node.name}': implement as visual-level calculation in Power BI report view
+9. CRITICAL: Output MUST start with measure name. Format: MeasureName = <formula>
 
 OUTPUT FORMAT (valid JSON only, no markdown):
 {{"dax_formula": "{calc_node.name} = <complete formula>", "reasoning": "<1-2 sentence explanation>", "confidence": 0.9}}
 
 Examples:
-- {{"dax_formula": "Total Sales = SUM(Sales[Amount])", "reasoning": "Simple sum aggregation", "confidence": 0.95}}
-- {{"dax_formula": "Active Amount = CALCULATE(SUM(Sales[Amount]), Sales[Status] = \\"Active\\")", "reasoning": "IF filter converted to CALCULATE", "confidence": 0.9}}
-- {{"dax_formula": "Growth % = DIVIDE([Current Sales], [Prior Sales], 0) * 100", "reasoning": "Both are known measures, referenced directly", "confidence": 0.9}}"""
+- {{"dax_formula": "Total Sales = SUM(Sales[Amount])", "reasoning": "Base numeric column summed from Sales table", "confidence": 0.95}}
+- {{"dax_formula": "Active Amount = CALCULATE(SUM(Sales[Amount]), Sales[Status] = \\"Active\\")", "reasoning": "IF on base column → CALCULATE+filter", "confidence": 0.9}}
+- {{"dax_formula": "Growth % = DIVIDE([Current Sales], [Prior Sales], 0) * 100", "reasoning": "Both are known measures, referenced directly", "confidence": 0.9}}
+- {{"dax_formula": "Cross Sell % = DIVIDE([cross sell placed], SUM(Budget[Cross sell budget]), 0) * 100", "reasoning": "Numerator is a measure, denominator is a base budget column", "confidence": 0.88}}"""
 
         logger.debug(f"Converting: {calc_node.name}")
 

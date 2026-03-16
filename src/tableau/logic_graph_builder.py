@@ -121,11 +121,14 @@ class CalculationNode:
     context_transition: ContextTransition = None  # NEW: Component 2
     tableau_role: str = None  # "measure" or "dimension" from Tableau
     depends_on_metadata: Dict[str, FieldDependency] = None  # NEW: Dependency metadata
+    source_tables: List[str] = None  # Physical source tables from extractor cols/map
 
     def __post_init__(self):
         """Initialize mutable default values"""
         if self.depends_on_metadata is None:
             self.depends_on_metadata = {}
+        if self.source_tables is None:
+            self.source_tables = []
 
 
 class LogicGraphBuilder:
@@ -219,25 +222,13 @@ class LogicGraphBuilder:
             # Build dependency metadata
             depends_on_metadata = {}
             for dep in dependencies:
-                if dep in self.base_fields:
-                    # Base column from data source - use enhanced metadata
-                    metadata = self.base_field_metadata.get(dep, {})
-                    generic_type = metadata.get("generic_type", "UNKNOWN")
-                    
-                    # Heuristic: Numeric = Potential Measure, String/Date = Dimension
-                    # This allows DAX Generator to wrap numeric fields in SUM() while leaving dimensions alone
-                    role = "measure" if generic_type == "NUMERIC" else "dimension"
-                    
-                    depends_on_metadata[dep] = FieldDependency(
-                        field_name=dep,
-                        field_type="BASE_COLUMN",
-                        original_role=role, 
-                        is_aggregated=False,
-                        source_calc=None
-                    )
-                elif dep in self.calculations:
+                # Strip trailing table qualifier ` [calc (Table)]` -> `calc`
+                # because self.calculations uses the base name.
+                clean_dep = re.sub(r'\s*\([^\)]+\)$', '', dep).strip()
+
+                if clean_dep in self.calculations:
                     # Reference to another calculation
-                    dep_calc = self.calculations[dep]
+                    dep_calc = self.calculations[clean_dep]
 
                     # Determine if it's a measure or calculated column
                     if dep_calc.calc_type == CalculationType.MEASURE:
@@ -248,36 +239,51 @@ class LogicGraphBuilder:
                         is_aggregated = False
 
                     depends_on_metadata[dep] = FieldDependency(
-                        field_name=dep,
+                        field_name=clean_dep,
                         field_type=field_type,
-                        original_role=self.field_roles.get(dep, "unknown"),
+                        original_role=self.field_roles.get(clean_dep, "unknown"),
                         is_aggregated=is_aggregated,
                         source_calc=dep_calc
+                    )
+                elif clean_dep in self.base_fields:
+                    # Base column from data source
+                    metadata = self.base_field_metadata.get(clean_dep, {})
+                    generic_type = metadata.get("generic_type", "UNKNOWN")
+                    
+                    role = "measure" if generic_type == "NUMERIC" else "dimension"
+                    
+                    depends_on_metadata[dep] = FieldDependency(
+                        field_name=clean_dep,
+                        field_type="BASE_COLUMN",
+                        original_role=role, 
+                        is_aggregated=False,
+                        source_calc=None
                     )
                 else:
                     # Unknown field - conservative fallback
                     depends_on_metadata[dep] = FieldDependency(
-                        field_name=dep,
+                        field_name=clean_dep,
                         field_type="UNKNOWN",
                         original_role="unknown",
                         is_aggregated=False,
                         source_calc=None
                     )
-                    logger.warning(f"❌ {dep} → UNKNOWN (not in base_fields or calculations!)")
+                    logger.warning(f"❌ {dep} (clean: {clean_dep}) → UNKNOWN (not in calculations or base_fields!)")
 
             # Store metadata in node
             node.depends_on_metadata = depends_on_metadata
 
             # Add edges: dependency -> calculation
             for dep in dependencies:
-                if dep in self.calculations:
+                clean_dep = re.sub(r'\s*\([^\)]+\)$', '', dep).strip()
+                if clean_dep in self.calculations:
                     # Dependency is another calculation
-                    self.graph.add_edge(dep, calc_name)
+                    self.graph.add_edge(clean_dep, calc_name)
                 else:
                     # Dependency is a base field
-                    if dep not in self.graph:
-                        self.graph.add_node(dep, type="base_field")
-                    self.graph.add_edge(dep, calc_name)
+                    if clean_dep not in self.graph:
+                        self.graph.add_node(clean_dep, type="base_field")
+                    self.graph.add_edge(clean_dep, calc_name)
 
         # Step 4: Calculate dependency levels
         self._calculate_dependency_levels()
@@ -359,6 +365,8 @@ class LogicGraphBuilder:
         name = calc.get("caption") or calc.get("internal_name") or calc.get("name")
         formula = calc.get("formula", "")
         role = calc.get("role", "measure")
+        # source_tables is populated by tableau_extractor.py via cols/map reverse lookup
+        source_tables = calc.get("source_tables", []) or []
 
         node = CalculationNode(
             calc_id=name,
@@ -370,12 +378,13 @@ class LogicGraphBuilder:
             dependency_level=0,
             visual_context=VisualContext(
                 used_in_worksheets=[],
-                visual_types=[],  # NEW
+                visual_types=[],
                 partition_by=[],
                 sort_by=[],
                 filters=FilterContext([], [], False)
             ),
-            tableau_role=role  # Preserve Tableau role
+            tableau_role=role,
+            source_tables=source_tables,  # ← ground-truth table names from extractor
         )
 
         self.calculations[name] = node
@@ -401,6 +410,12 @@ class LogicGraphBuilder:
         # LOD expressions
         if re.search(r'\{(FIXED|INCLUDE|EXCLUDE)', formula, re.IGNORECASE):
             return CalculationType.LOD_EXPRESSION
+
+        # Heuristic: If Tableau explicitly typed it as a measure, trust it over the formula
+        # (e.g. IF [Col]='A' THEN [Amount] END is a row-level column, but saved as a Measure 
+        # so it gets aggregated by default in views, and converted to DAX MEASUREs via rules)
+        if calc.get("role") == "measure":
+            return CalculationType.MEASURE
 
         # Default: calculated column (row-level)
         return CalculationType.CALCULATED_COLUMN
@@ -474,8 +489,9 @@ class LogicGraphBuilder:
             # Level = max(dependency levels) + 1
             dep_levels = []
             for dep in node.depends_on:
-                if dep in self.calculations:
-                    dep_levels.append(self.calculations[dep].dependency_level)
+                clean_dep = re.sub(r'\s*\([^\)]+\)$', '', dep).strip()
+                if clean_dep in self.calculations:
+                    dep_levels.append(self.calculations[clean_dep].dependency_level)
                 else:
                     # Base field = level 0
                     dep_levels.append(0)
@@ -524,8 +540,9 @@ class LogicGraphBuilder:
 
 
             for field in all_fields:
-                if field in self.calculations:
-                    node = self.calculations[field]
+                clean_field = re.sub(r'\s*\([^\)]+\)$', '', field).strip()
+                if clean_field in self.calculations:
+                    node = self.calculations[clean_field]
 
                     # Add worksheet
                     if ws_name not in node.visual_context.used_in_worksheets:
@@ -537,8 +554,8 @@ class LogicGraphBuilder:
 
                     # Determine partition (grouping) dimensions
                     partition_dims = [
-                        f for f in cleaned_rows + cleaned_cols
-                        if f != field and f not in self.calculations
+                        re.sub(r'\s*\([^\)]+\)$', '', f).strip() for f in cleaned_rows + cleaned_cols
+                        if f != field and re.sub(r'\s*\([^\)]+\)$', '', f).strip() not in self.calculations
                     ]
 
                     for dim in partition_dims:

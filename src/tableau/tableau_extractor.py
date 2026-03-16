@@ -160,6 +160,67 @@ def _tableau_to_dax(formula: str, caption_map: dict) -> dict:
     }
 
 
+# ── Cols/map alias → source-table helpers ──────────────────────────────────────
+
+def _build_cols_alias_map(root: etree._Element) -> dict:
+    """
+    Build a reverse lookup from the <cols>/<map> section of the datasource.
+    Returns: {alias_key (no brackets): {"table": str, "column": str}}
+
+    Example entries from XML:
+      key='[Amount (Fees)]'   value='[Fees].[Amount]'
+      key='[income_class]'    value='[Brokage].[income_class]'
+    After parsing:
+      'Amount (Fees)'  -> {"table": "Fees",    "column": "Amount"}
+      'income_class'   -> {"table": "Brokage", "column": "income_class"}
+    """
+    alias_map = {}
+    for m in root.xpath("//datasource[not(@name='Parameters')]//cols/map"):
+        key = m.get("key", "").strip("[]")
+        val = m.get("value", "")
+        # val may look like '[Fees].[Amount]' or 'Fees_GUID].[Amount]'
+        parts = re.match(r'\[?([^\]]+)\]?\.\[?([^\]]+)\]?', val.strip())
+        if parts and key:
+            table_raw = parts.group(1).strip()
+            # Strip trailing GUID suffix from hyper extract table names
+            table_clean = re.sub(r'_[A-Fa-f0-9]{16,}$', '', table_raw)
+            # Handle '!' separated connection-based names (e.g., gcrm!opportunity!202001)
+            if '!' in table_clean:
+                segments = table_clean.split('!')
+                meaningful = [p for p in segments if not re.match(r'^\d+$', p)]
+                table_clean = meaningful[-1] if meaningful else segments[-1]
+            alias_map[key] = {
+                "table":  table_clean,
+                "column": parts.group(2).strip(),
+            }
+    return alias_map
+
+
+def _infer_source_tables(formula: str, alias_map: dict) -> list:
+    """
+    Scan all [bracketed] field references in a Tableau formula and resolve
+    each one through the alias_map to its physical source table.
+
+    Returns a sorted list of distinct table names found.
+    References that are Calculation_xxx IDs (other CFs) are skipped —
+    those CFs are table-agnostic aggregates.
+
+    Examples:
+      'IF [income_class (Fees)]=...' -> ['Fees']
+      'if [income_class]=... then [Amount] end' -> ['Brokage']
+      'sum([Calc_A]) + sum([Calc_B])' -> []   (cross-CF aggregate)
+    """
+    tables = set()
+    for bracket_ref in re.findall(r'\[([^\]]+)\]', formula):
+        # Skip Calculation_XXXXXXX IDs — those are other calculated fields, not table aliases
+        if re.match(r'Calculation_\d+', bracket_ref, re.IGNORECASE):
+            continue
+        info = alias_map.get(bracket_ref)
+        if info:
+            tables.add(info["table"])
+    return sorted(tables)
+
+
 # ── Individual Extraction Functions ────────────────────────────────────────────
 
 def extract_connections(root, ds_prefixes):
@@ -318,8 +379,9 @@ def extract_relationships(root, ds_prefixes):
     return relationships
 
 
-def extract_columns(root, ds_prefixes, caption_map):
+def extract_columns(root, ds_prefixes, caption_map, alias_map=None):
     """4. All column definitions with datatype, role, type (discrete/continuous), aggregation, format."""
+    alias_map = alias_map or {}
     columns = []
     seen = set()
     for col in root.xpath("//datasource[not(@name='Parameters')]/column"):
@@ -338,6 +400,8 @@ def extract_columns(root, ds_prefixes, caption_map):
         calc     = col.find("calculation")
         formula  = calc.get("formula","") if calc is not None else ""
         readable = _resolve_calc_ids(formula, caption_map) if formula else ""
+        # Resolve source tables: scan formula for alias-key references → table names
+        source_tables = _infer_source_tables(formula, alias_map) if formula else []
         columns.append({
             "internal_name":      name,
             "caption":            caption or name,
@@ -350,12 +414,14 @@ def extract_columns(root, ds_prefixes, caption_map):
             "geographic_role":    geo_role,
             "formula":            readable,
             "formula_type":       _classify_formula(formula) if formula else "",
+            "source_tables":      source_tables,   # e.g. ["Fees"] / ["Brokage"] / [] for cross-CF
         })
     return columns
 
 
-def extract_lod_calculations(root, caption_map):
+def extract_lod_calculations(root, caption_map, alias_map=None):
     """5. LOD (fixed/include/exclude) calculations with DAX hints."""
+    alias_map = alias_map or {}
     lods = []
     seen = set()
     for col in root.xpath("//datasource[not(@name='Parameters')]/column[@caption]/calculation"):
@@ -376,17 +442,19 @@ def extract_lod_calculations(root, caption_map):
             lod_type = m.group(1).upper()
         dimension_match = re.search(r'\{[^:]*:\s*(.+)\}', formula)
         lods.append({
-            "caption":   parent.get("caption",""),
-            "lod_type":  lod_type,
-            "formula":   readable,
-            "dax_hint":  dax_info["dax"],
-            "dax_note":  dax_info["note"],
+            "caption":      parent.get("caption",""),
+            "lod_type":     lod_type,
+            "formula":      readable,
+            "dax_hint":     dax_info["dax"],
+            "dax_note":     dax_info["note"],
+            "source_tables": _infer_source_tables(formula, alias_map),
         })
     return lods
 
 
-def extract_table_calcs(root, caption_map):
+def extract_table_calcs(root, caption_map, alias_map=None):
     """6. Table calculations (RUNNING_SUM, RANK, etc.)."""
+    alias_map = alias_map or {}
     calcs = []
     seen = set()
     for col in root.xpath("//datasource[not(@name='Parameters')]/column[@caption]/calculation"):
@@ -401,10 +469,11 @@ def extract_table_calcs(root, caption_map):
         # Try to get table-calc sub-element
         tc = col.find("table-calc")
         calcs.append({
-            "caption":    parent.get("caption",""),
-            "formula":    _resolve_calc_ids(formula, caption_map),
-            "tc_function": tc.get("function","") if tc is not None else "",
-            "pbi_note":   "Table calcs → visual calculations in Power BI (no direct measure equivalent)"
+            "caption":       parent.get("caption",""),
+            "formula":       _resolve_calc_ids(formula, caption_map),
+            "tc_function":   tc.get("function","") if tc is not None else "",
+            "source_tables": _infer_source_tables(formula, alias_map),
+            "pbi_note":      "Table calcs → visual calculations in Power BI (no direct measure equivalent)"
         })
     return calcs
 
@@ -978,6 +1047,9 @@ def extract_tableau_model(twbx_path: str) -> dict:
         caption  = col.get("caption","")
         caption_map[internal] = caption
 
+    # Build alias map once — used by all CF extractors to resolve table names
+    alias_map = _build_cols_alias_map(root)
+
     model = {
         "_meta": {
             "source_file":     str(Path(twbx_path).name),
@@ -993,9 +1065,9 @@ def extract_tableau_model(twbx_path: str) -> dict:
         "blends":           extract_blends(root, ds_prefixes),        # data blending
 
         # ── Semantic / Column layer ───────────────────────────────────────
-        "columns":          extract_columns(root, ds_prefixes, caption_map),
-        "lod_calcs":        extract_lod_calculations(root, caption_map),
-        "table_calcs":      extract_table_calcs(root, caption_map),
+        "columns":          extract_columns(root, ds_prefixes, caption_map, alias_map),
+        "lod_calcs":        extract_lod_calculations(root, caption_map, alias_map),
+        "table_calcs":      extract_table_calcs(root, caption_map, alias_map),
         "hierarchies":      extract_hierarchies(root, ds_prefixes),
         "groups":           extract_groups(root, ds_prefixes),
         "sets":             extract_sets(root, ds_prefixes),
