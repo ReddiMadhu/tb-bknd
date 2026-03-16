@@ -125,7 +125,7 @@ class DAXGenerator:
             return_expr = match.group(2).strip()
 
             # Only convert if it's Table[Column] format, not bare [Measure]
-            if re.match(r'^[A-Za-z_][A-Za-z0-9_\s]*\[[^\]]+\]$', return_expr):
+            if re.match(r"^'?[A-Za-z_][A-Za-z0-9_\s]*'?\[[^\]]+\]$", return_expr):
                 new_formula = f"CALCULATE(SUM({return_expr}), {condition})"
                 result.dax_formula = f"{name_prefix}{new_formula}"
                 result.reasoning += "\nPost-processed: Converted IF() to CALCULATE(SUM())."
@@ -191,7 +191,7 @@ class DAXGenerator:
                         st = getattr(calc_node, "source_tables", [])
                         phys = st[0] if st else (table_name or "Table")
                     dep_lines.append(
-                        f"  [{dep_name}] → BASE NUMERIC COLUMN in '{phys}' — use SUM({phys}[{dep_name}])"
+                        f"  [{dep_name}] → BASE NUMERIC COLUMN in '{phys}' — use SUM('{phys}'[{dep_name}])"
                     )
                 elif ft == "BASE_COLUMN":
                     phys = table_refs.get(dep_name)
@@ -199,7 +199,7 @@ class DAXGenerator:
                         st = getattr(calc_node, "source_tables", [])
                         phys = st[0] if st else (table_name or "Table")
                     dep_lines.append(
-                        f"  [{dep_name}] → BASE DIMENSION COLUMN in '{phys}' — use {phys}[{dep_name}] in filter args, NOT in SUM()"
+                        f"  [{dep_name}] → BASE DIMENSION COLUMN in '{phys}' — use '{phys}'[{dep_name}] in filter args, NOT in SUM()"
                     )
                 elif ft == "CALCULATED_COLUMN":
                     dep_lines.append(f"  [{dep_name}] → CALCULATED COLUMN (row-level) — use Table[Name] or as filter arg")
@@ -252,10 +252,10 @@ CALCULATION TYPE: {calc_type_str} | GRANULARITY: {granularity_str}{lod_info}
 
 CONVERSION RULES:
 1. MEASURES (is_aggregated / CALCULATED_MEASURE): [MeasureName] — no table, no SUM()
-2. BASE NUMERIC COLUMNS: SUM(Table[Col]) / AVG / COUNT / MIN / MAX as appropriate
-3. BASE DIMENSION COLUMNS: Table[Col] inside CALCULATE/filter args — never in SUM()
+2. BASE NUMERIC COLUMNS: SUM('Table'[Col]) / AVG / COUNT / MIN / MAX as appropriate
+3. BASE DIMENSION COLUMNS: 'Table'[Col] inside CALCULATE/filter args — never in SUM()
 4. IF patterns:
-   - IF Table[col] = "val" THEN Table[Amount] END → CALCULATE(SUM(Table[Amount]), Table[col] = "val")
+   - IF 'Table'[col] = "val" THEN 'Table'[Amount] END → CALCULATE(SUM('Table'[Amount]), 'Table'[col] = "val")
    - IF condition THEN [Measure] END → CALCULATE([Measure], condition)
    - IF condition THEN "text" END → IF(condition, "text", BLANK())
    - IF condition THEN 1 ELSE 0 END → IF(condition, 1, 0)
