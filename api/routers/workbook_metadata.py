@@ -188,10 +188,28 @@ async def get_workbook_worksheets(migration_id: str, workbook_id: str):
                         "name": m_name
                     })
 
+            def _format_axis_simple(shelf_list):
+                formatted = []
+                for item in shelf_list:
+                    import re as _re
+                    m = _re.search(r'\[([^\]]+)\]', str(item))
+                    name = m.group(1) if m else str(item).strip("[] ")
+                    
+                    # Try to map to caption if it exists in calc_map
+                    col = calc_map.get(name)
+                    label = _norm_table(col.get("caption") or name) if col else _norm_table(name)
+                    formatted.append(label)
+                return ", ".join(formatted)
+
+            axes_dict = {
+                "rows": _format_axis_simple(ws.get("rows", [])),
+                "columns": _format_axis_simple(ws.get("cols", []))
+            }
+
             worksheets.append({
                 "worksheet_name": ws.get("name", ""),
                 "chart_type": ws.get("mark_type", "Automatic"),
-                "axes": ws.get("axes", {}), # In new model it might be combined
+                "axes": axes_dict,
                 "dimensions": ws.get("dimensions", []),
                 "measures": resolved_measures,
                 "name": ws.get("name", ""),
@@ -499,30 +517,21 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                 worksheets_raw = model.get("worksheets", [])
                 worksheets = []
                 # Build lookup sets for quick field matching
-                # key = caption (display name), value = full column dict
                 calc_by_caption = {}
                 calc_by_internal = {}
                 for col in model.get("columns", []):
-                    if not col.get("formula"):
-                        continue
                     internal = col.get("internal_name", "")
                     caption  = col.get("caption") or internal
                     calc_by_caption[caption]  = col
                     calc_by_internal[internal] = col
 
                 def _classify_field(raw_name: str):
-                    """
-                    Given a field name as it appears on a shelf (e.g. '[Brokage new]',
-                    'SUM([Cross sell bugdet])'), strip brackets/aggregation and look up
-                    in calc_map.  Returns (display_name, col_dict_or_None).
-                    """
                     import re as _re
-                    # Strip aggregation prefix e.g. SUM([...]) → ...
+                    is_agg = bool(_re.match(r'^[A-Z]{3,}\(', raw_name.strip()))
                     m = _re.search(r'\[([^\]]+)\]', raw_name)
                     name = m.group(1) if m else raw_name.strip("[] ")
-                    # Try caption lookup first (most common after extractor resolution)
                     col = calc_by_caption.get(name) or calc_by_internal.get(name)
-                    return name, col
+                    return name, col, is_agg
 
                 for ws in worksheets_raw:
                     ws_name   = ws.get("name", "")
@@ -530,16 +539,12 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
 
                     # Collect every field reference on this worksheet's shelves
                     all_shelf_fields = []
-                    # rows / cols shelves (list of strings like "SUM([Field])")
                     all_shelf_fields += ws.get("rows", [])
                     all_shelf_fields += ws.get("cols", [])
-                    # pane encodings (list of dicts {pane_id, encodings:{color:..., size:...}})
                     for pane in ws.get("pane_encodings", []):
                         all_shelf_fields += list(pane.get("encodings", {}).values())
-                    # window_cards / dashboard_cards
                     all_shelf_fields += list(ws.get("window_cards", {}).values())
                     all_shelf_fields += list(ws.get("dashboard_cards", {}).values())
-                    # filter fields (list of dicts with 'field' key)
                     for f in ws.get("filters", []):
                         fld = f.get("field") if isinstance(f, dict) else f
                         if fld:
@@ -547,26 +552,23 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
 
                     # Deduplicate while preserving order
                     seen_fields = set()
-                    resolved_measures   = []  # {type, name, formula?}
-                    resolved_dimensions = []  # list of display names
-                    ws_calculated_fields = [] # full calc field objects for this worksheet
+                    resolved_measures   = []
+                    resolved_dimensions = []
+                    ws_calculated_fields = []
 
                     for raw in all_shelf_fields:
                         if not raw:
                             continue
-                        display_name, col = _classify_field(str(raw))
+                        display_name, col, is_agg = _classify_field(str(raw))
                         if display_name in seen_fields:
                             continue
                         seen_fields.add(display_name)
 
-                        if col:
-                            # It's a calculated field
-                            calc_display_name = _norm_table(col.get("caption") or display_name)
-                            resolved_measures.append({
-                                "type":    "calculated",
-                                "name":    calc_display_name,
-                                "formula": col.get("formula", "")
-                            })
+                        calc_display_name = _norm_table(col.get("caption") or display_name) if col else _norm_table(display_name)
+                        is_calc = bool(col and col.get("formula"))
+                        role = col.get("role", "").lower() if col else "dimension"
+
+                        if is_calc:
                             ws_calculated_fields.append({
                                 "name":      calc_display_name,
                                 "formula":   col.get("formula", ""),
@@ -574,23 +576,85 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                                 "datatype":  col.get("datatype", ""),
                                 "role":      col.get("role", ""),
                             })
+                            if role == "dimension" and not is_agg:
+                                resolved_dimensions.append(calc_display_name)
+                            else:
+                                resolved_measures.append({
+                                    "type": "calculated",
+                                    "name": calc_display_name,
+                                    "formula": col.get("formula", "")
+                                })
                         else:
-                            # Base field — treat as dimension (could also be base measure,
-                            # frontend won't filter on it anyway)
-                            norm_display = _norm_table(display_name)
-                            resolved_dimensions.append(norm_display)
-                            resolved_measures.append({
-                                "type": "base_measure",
-                                "name": norm_display
-                            })
+                            if is_agg or role == "measure":
+                                resolved_measures.append({
+                                    "type": "base_measure",
+                                    "name": calc_display_name
+                                })
+                            else:
+                                resolved_dimensions.append(calc_display_name)
 
                     # Deduplicate dimensions list
                     unique_dimensions = list(dict.fromkeys(resolved_dimensions))
 
+                    # Construct axes for the frontend properly mapped as strings
+                    def _format_axis(shelf_list):
+                        formatted = []
+                        for item in shelf_list:
+                            name, col, is_agg = _classify_field(str(item))
+                            label = _norm_table(col.get("caption") or name) if col else _norm_table(name)
+                            formatted.append(label)
+                        return ", ".join(formatted)
+
+                    axes_dict = {
+                        "rows": _format_axis(ws.get("rows", [])),
+                        "columns": _format_axis(ws.get("cols", []))
+                    }
+
+                    # Infer chart type if Automatic
+                    inferred_chart_type = mark_type or "Automatic"
+                    if inferred_chart_type.lower() == "automatic":
+                        def has_date(shelf):
+                            import re
+                            for item in shelf:
+                                item_str = str(item).strip()
+                                if re.match(r'^(YEAR|QUARTER|MONTH|DAY|WEEK|MDY|MY)\(', item_str):
+                                    return True
+                                name, col, is_agg = _classify_field(item_str)
+                                if col and col.get('datatype') in ['date', 'datetime']:
+                                    return True
+                            return False
+
+                        def count_meas_dim(shelf):
+                            meas_cnt = 0
+                            dim_cnt = 0
+                            import re
+                            for item in shelf:
+                                if re.match(r'^[A-Z]{3,}\(', str(item).strip()):
+                                    meas_cnt += 1
+                                else:
+                                    dim_cnt += 1
+                            return meas_cnt, dim_cnt
+
+                        r_meas, r_dim = count_meas_dim(ws.get("rows", []))
+                        c_meas, c_dim = count_meas_dim(ws.get("cols", []))
+
+                        if r_meas > 0 and c_meas > 0:
+                            inferred_chart_type = "Scatter Plot"
+                        elif (has_date(ws.get("cols", [])) and r_meas > 0) or (has_date(ws.get("rows", [])) and c_meas > 0):
+                            inferred_chart_type = "Line Chart"
+                        elif (r_dim > 0 and c_meas > 0) or (c_dim > 0 and r_meas > 0):
+                            inferred_chart_type = "Bar Chart"
+                        elif r_dim > 0 and c_dim > 0:
+                            inferred_chart_type = "Text Table"
+                        elif (r_meas + r_dim + c_meas + c_dim) == 0 and len(resolved_measures) > 0:
+                            inferred_chart_type = "Card"
+                        else:
+                            inferred_chart_type = "Text Table"
+
                     worksheets.append({
                         "worksheet_name":    ws_name,
-                        "chart_type":        mark_type or "Automatic",
-                        "axes":              ws.get("axes", {}),
+                        "chart_type":        inferred_chart_type,
+                        "axes":              axes_dict,
                         "dimensions":        unique_dimensions,
                         "measures":          resolved_measures,
                         "calculated_fields": ws_calculated_fields,
