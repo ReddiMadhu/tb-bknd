@@ -34,10 +34,41 @@ DERIV_RE = re.compile(r'^(' + '|'.join(TABLEAU_DERIVATIONS) + r'):', re.IGNORECA
 
 # ── Helper utilities ────────────────────────────────────────────────────────────
 
-def _load_xml(twbx_path: str) -> etree._Element:
-    with zipfile.ZipFile(twbx_path, 'r') as zf:
-        twb_name = next(f for f in zf.namelist() if f.endswith('.twb'))
-        return etree.fromstring(zf.read(twb_name))
+def _load_xml(path: str) -> etree._Element:
+    """Load Tableau XML from either a .twbx ZIP archive or a plain .twb file."""
+    p = Path(path)
+    if p.suffix.lower() == '.twbx':
+        with zipfile.ZipFile(path, 'r') as zf:
+            twb_name = next(f for f in zf.namelist() if f.endswith('.twb'))
+            return etree.fromstring(zf.read(twb_name))
+    # Plain .twb XML file
+    return etree.parse(path).getroot()
+
+
+def detect_model_type(root: etree._Element) -> str:
+    """
+    Detect whether the workbook uses:
+      - 'JOIN'         — physical SQL joins (Tableau legacy model)
+      - 'RELATIONSHIP' — logical relationships (Tableau 2020.2+ object model)
+      - 'FLAT'         — single table, no joins or relationships
+    """
+    if root.xpath("//relation[@type='join']"):
+        return "JOIN"
+    if root.xpath("//*[local-name()='relationships']/*[local-name()='relationship']"):
+        return "RELATIONSHIP"
+    return "FLAT"
+
+
+def _infer_cardinality(relationships: list) -> str:
+    """
+    Infer overall cardinality from the extracted relationships list.
+    Returns 'many-to-many' if any relationship is explicitly many-to-many,
+    otherwise 'many-to-one' (Tableau XML default — cardinality is not stored).
+    """
+    for r in relationships:
+        if r.get("cardinality") in ("many-to-many", "*:*"):
+            return "many-to-many"
+    return "many-to-one"
 
 
 def _build_ds_prefixes(root: etree._Element) -> list:
@@ -48,6 +79,46 @@ def _build_ds_prefixes(root: etree._Element) -> list:
             prefixes.append(f"[{name}].")
             prefixes.append(f"{name}].")
     return prefixes
+
+
+def _normalize_table_name(raw_name: str) -> str:
+    """
+    Normalize a Tableau table name strictly to a unified clean form.
+    Handles 'Extract.Meeting_C95B...', 'gcrm!opportunity!2020...', 'Gcrm_Opportunity_2020...'
+    and also updates field names like 'Product Group (Gcrm_Opportunity_2020...)' -> 'Product Group (Opportunity)'
+    """
+    if not raw_name or not isinstance(raw_name, str):
+        return raw_name
+
+    def clean_table(t: str) -> str:
+        # Strip "Extract." prefix
+        if '.' in t:
+            t = t.split('.')[-1]
+        t = t.strip('"').strip("'")
+        
+        # Strip 32-char GUID or >=8 char GUID
+        t = re.sub(r'_[A-Fa-f0-9]{8,}$', '', t)
+        
+        # If it looks like a Tableau joined/extracted namespace (gcrm!opportunity!timestamp or Gcrm_Opportunity_timestamp)
+        parts = re.split(r'[!_]', t)
+        meaningful = [p for p in parts if not re.match(r'^\d+$', p) and p]
+        
+        if len(meaningful) >= 2 and meaningful[0].lower() in ['gcrm', 'extract', 'logical']:
+            t = meaningful[-1]
+        elif '!' in t:
+            t = meaningful[-1] if meaningful else t
+            
+        # Capitalize gracefully
+        return t.title() if t.islower() else t
+
+    # Handle (TableName) suffix in field/dimension names
+    def _repl_table(match):
+        return f"({clean_table(match.group(1))})"
+
+    if '(' in raw_name and ')' in raw_name:
+        return re.sub(r'\(([^)]+)\)', _repl_table, raw_name)
+
+    return clean_table(raw_name)
 
 
 def _clean_field(s: str, ds_prefixes: list) -> str:
@@ -86,77 +157,220 @@ def _classify_formula(formula: str) -> str:
     return 'STANDARD'
 
 
-def _tableau_to_dax(formula: str, caption_map: dict) -> dict:
+def _tableau_to_dax(formula: str, caption_map: dict,
+                    model_type: str = "FLAT",
+                    cardinality: str = "many-to-one") -> dict:
     """
-    Convert a Tableau formula to approximate DAX.
-    Returns {"dax": str, "note": str, "confidence": "high"|"medium"|"low"}.
+    Convert a Tableau formula to approximate DAX, using the correct pattern
+    for the workbook's model type and relationship cardinality.
+
+    Decision tree:
+      LOD FIXED  → CALCULATE + ALLEXCEPT
+      LOD INCLUDE → AVERAGEX + VALUES
+      LOD EXCLUDE → CALCULATE + ALL
+      RUNNING_SUM / WINDOW_SUM → CALCULATE + FILTER (running total)
+      RANK        → RANKX
+      COUNTD      → DISTINCTCOUNT  (always safe)
+      SUM/AVG
+        JOIN | FLAT | RELATIONSHIP many-to-one  → SUM() directly
+        RELATIONSHIP many-to-many               → SUMX + VALUES
+
+    Returns {"dax": str, "note": str, "confidence": str, "pattern": str}.
     """
     readable = _resolve_calc_ids(formula, caption_map)
-    # Replace bare calc IDs in formulas
     for cid, cap in caption_map.items():
         readable = readable.replace(f"[{cid}]", f"[{cap}]")
 
-    # Pattern 1: row-level conditional → CALCULATE+filter
-    cond = re.match(
-        r'if\s+\[([^\]]+)\]\s*=\s*"([^"]+)"\s+then\s+\[([^\]]+)\]\s+end',
+    upper = readable.strip().upper()
+
+    # ── LOD: FIXED ──────────────────────────────────────────────────────────
+    fixed_m = re.search(
+        r'\{\s*FIXED\s+\[([^\]]+)\]\s*:\s*(.+?)\}',
+        readable.strip(), re.IGNORECASE | re.DOTALL
+    )
+    if fixed_m:
+        dim  = fixed_m.group(1).strip()
+        expr = fixed_m.group(2).strip()
+        # Extract inner aggregation
+        agg_m = re.match(r'(SUM|AVG|COUNT|COUNTD|MIN|MAX)\(\[([^\]]+)\]\)', expr, re.IGNORECASE)
+        if agg_m:
+            agg_fn  = agg_m.group(1).upper().replace("COUNTD", "DISTINCTCOUNT").replace("AVG", "AVERAGE")
+            col     = agg_m.group(2)
+            dax_str = (f"CALCULATE(\n"
+                       f"    {agg_fn}(TableName[{col}]),\n"
+                       f"    ALLEXCEPT(TableName, TableName[{dim}])\n)")
+        else:
+            dax_str = f"CALCULATE({expr}, ALLEXCEPT(TableName, TableName[{dim}]))"
+        return {"dax": dax_str,
+                "note": "FIXED LOD → CALCULATE + ALLEXCEPT. Replace TableName.",
+                "confidence": "high", "pattern": "CALCULATE_ALLEXCEPT"}
+
+    # ── LOD: INCLUDE ────────────────────────────────────────────────────────
+    include_m = re.search(
+        r'\{\s*INCLUDE\s+\[([^\]]+)\]\s*:\s*(AVG|AVERAGE)\(\[([^\]]+)\]\)\s*\}',
         readable.strip(), re.IGNORECASE
     )
-    if cond:
-        dim, val, meas = cond.group(1), cond.group(2), cond.group(3)
+    if include_m:
+        dim = include_m.group(1).strip()
+        col = include_m.group(3).strip()
+        dax_str = (f"AVERAGEX(\n"
+                   f"    VALUES(TableName[{dim}]),\n"
+                   f"    CALCULATE(AVERAGE(TableName[{col}]))\n)")
+        return {"dax": dax_str,
+                "note": "INCLUDE LOD → AVERAGEX + VALUES. Replace TableName.",
+                "confidence": "high", "pattern": "AVERAGEX_VALUES"}
+
+    include_gen_m = re.search(
+        r'\{\s*INCLUDE\s+\[([^\]]+)\]\s*:\s*(.+?)\}',
+        readable.strip(), re.IGNORECASE | re.DOTALL
+    )
+    if include_gen_m:
+        dim  = include_gen_m.group(1).strip()
+        expr = include_gen_m.group(2).strip()
+        dax_str = f"AVERAGEX(VALUES(TableName[{dim}]), CALCULATE({expr}))"
+        return {"dax": dax_str,
+                "note": "INCLUDE LOD → AVERAGEX + VALUES. Replace TableName.",
+                "confidence": "medium", "pattern": "AVERAGEX_VALUES"}
+
+    # ── LOD: EXCLUDE ────────────────────────────────────────────────────────
+    exclude_m = re.search(
+        r'\{\s*EXCLUDE\s+\[([^\]]+)\]\s*:\s*(.+?)\}',
+        readable.strip(), re.IGNORECASE | re.DOTALL
+    )
+    if exclude_m:
+        dim  = exclude_m.group(1).strip()
+        expr = exclude_m.group(2).strip()
+        agg_m = re.match(r'(SUM|AVG|COUNT|COUNTD|MIN|MAX)\(\[([^\]]+)\]\)', expr, re.IGNORECASE)
+        if agg_m:
+            agg_fn  = agg_m.group(1).upper().replace("COUNTD", "DISTINCTCOUNT").replace("AVG", "AVERAGE")
+            col     = agg_m.group(2)
+            dax_str = f"CALCULATE({agg_fn}(TableName[{col}]), ALL(TableName[{dim}]))"
+        else:
+            dax_str = f"CALCULATE({expr}, ALL(TableName[{dim}]))"
+        return {"dax": dax_str,
+                "note": "EXCLUDE LOD → CALCULATE + ALL. Replace TableName.",
+                "confidence": "high", "pattern": "CALCULATE_ALL"}
+
+    # ── Table Calculations: RUNNING_SUM / WINDOW_SUM ─────────────────────────
+    if re.search(r'\b(RUNNING_SUM|WINDOW_SUM)\b', upper):
+        col_m = re.search(r'(?:RUNNING_SUM|WINDOW_SUM)\((?:SUM\()?\[([^\]]+)\]', readable, re.IGNORECASE)
+        col = col_m.group(1) if col_m else "Amount"
+        dax_str = (f"CALCULATE(\n"
+                   f"    SUM(TableName[{col}]),\n"
+                   f"    FILTER(ALL(TableName), TableName[Date] <= MAX(TableName[Date]))\n)")
+        return {"dax": dax_str,
+                "note": "Running total pattern. Replace TableName and Date column.",
+                "confidence": "medium", "pattern": "RUNNING_TOTAL"}
+
+    # ── Table Calculations: RANK ─────────────────────────────────────────────
+    if re.search(r'\bRANK\s*\(', upper):
+        return {
+            "dax": "RANKX(ALL(TableName[Dimension]), [MeasureName])",
+            "note": "RANK() → RANKX. Replace TableName, Dimension, and MeasureName.",
+            "confidence": "medium", "pattern": "RANKX"
+        }
+
+    # ── COUNTD → DISTINCTCOUNT ───────────────────────────────────────────────
+    # Safe for any model type
+    countd_m = re.match(r'COUNTD\(\[([^\]]+)\]\)', readable.strip(), re.IGNORECASE)
+    if countd_m:
+        col = countd_m.group(1)
+        return {"dax": f"DISTINCTCOUNT(TableName[{col}])",
+                "note": "COUNTD → DISTINCTCOUNT. Replace TableName.",
+                "confidence": "high", "pattern": "DIRECT_AGG"}
+
+    # ── SUM — model-type and cardinality aware ────────────────────────────────
+    sum_m = re.match(r'SUM\(\[([^\]]+)\]\)', readable.strip(), re.IGNORECASE)
+    if sum_m:
+        col = sum_m.group(1)
+        if model_type == "RELATIONSHIP" and cardinality == "many-to-many":
+            dax_str = (f"SUMX(\n"
+                       f"    VALUES(TableName[JoinKey]),\n"
+                       f"    CALCULATE(SUM(TableName[{col}]))\n)")
+            return {"dax": dax_str,
+                    "note": "many-to-many RELATIONSHIP → SUMX + VALUES. Replace TableName and JoinKey.",
+                    "confidence": "high", "pattern": "SUMX_VALUES"}
+        return {"dax": f"SUM(TableName[{col}])",
+                "note": "Direct SUM — safe for JOIN / many-to-one RELATIONSHIP. Replace TableName.",
+                "confidence": "high", "pattern": "DIRECT_AGG"}
+
+    # ── AVG — model-type and cardinality aware ────────────────────────────────
+    avg_m = re.match(r'(?:AVG|AVERAGE)\(\[([^\]]+)\]\)', readable.strip(), re.IGNORECASE)
+    if avg_m:
+        col = avg_m.group(1)
+        if model_type == "RELATIONSHIP" and cardinality == "many-to-many":
+            dax_str = (f"AVERAGEX(\n"
+                       f"    VALUES(TableName[JoinKey]),\n"
+                       f"    CALCULATE(AVERAGE(TableName[{col}]))\n)")
+            return {"dax": dax_str,
+                    "note": "many-to-many RELATIONSHIP → AVERAGEX + VALUES. Replace TableName and JoinKey.",
+                    "confidence": "high", "pattern": "AVERAGEX_VALUES"}
+        return {"dax": f"AVERAGE(TableName[{col}])",
+                "note": "Direct AVERAGE — safe for JOIN / many-to-one. Replace TableName.",
+                "confidence": "high", "pattern": "DIRECT_AGG"}
+
+    # ── Combined SUM+SUM (cross-table) ────────────────────────────────────────
+    add_m = re.match(
+        r'SUM\(\[([^\]]+)\]\)\s*\+\s*SUM\(\[([^\]]+)\]\)',
+        readable.strip(), re.IGNORECASE
+    )
+    if add_m:
+        if model_type == "RELATIONSHIP" and cardinality == "many-to-many":
+            dax_str = (f"SUMX(\n"
+                       f"    VALUES(FactTable[JoinKey]),\n"
+                       f"    CALCULATE(SUM(Table1[{add_m.group(1)}])) + CALCULATE(SUM(Table2[{add_m.group(2)}]))\n)")
+            return {"dax": dax_str,
+                    "note": "Cross-table sum in many-to-many → SUMX + VALUES pattern. Replace table names.",
+                    "confidence": "medium", "pattern": "SUMX_VALUES"}
+        return {"dax": f"[{add_m.group(1)}] + [{add_m.group(2)}]",
+                "note": "Combine two measures. Create each SUM as a separate measure first.",
+                "confidence": "high", "pattern": "DIRECT_AGG"}
+
+    # ── Percentage: (SUM(A)/SUM(B))*100 ──────────────────────────────────────
+    pct_m = re.match(
+        r'\(SUM\(\[([^\]]+)\]\)\s*/\s*SUM\(\[([^\]]+)\]\)\)\s*\*\s*100',
+        readable.strip(), re.IGNORECASE
+    )
+    if pct_m:
+        return {"dax": f"DIVIDE([{pct_m.group(1)}], [{pct_m.group(2)}]) * 100",
+                "note": "DIVIDE() avoids division-by-zero errors.",
+                "confidence": "high", "pattern": "DIRECT_AGG"}
+
+    # ── Row-level IF conditional ──────────────────────────────────────────────
+    cond_m = re.match(
+        r'IF\s+\[([^\]]+)\]\s*=\s*"([^"]+)"\s+THEN\s+\[([^\]]+)\]\s+END',
+        readable.strip(), re.IGNORECASE
+    )
+    if cond_m:
+        dim, val, meas = cond_m.group(1), cond_m.group(2), cond_m.group(3)
         return {
             "dax": f'CALCULATE(SUM(TableName[{meas}]), TableName[{dim}] = "{val}")',
-            "note": "Replace TableName with actual table. Row-level filter → CALCULATE.",
-            "confidence": "medium"
+            "note": "Row-level filter → CALCULATE + filter. Replace TableName.",
+            "confidence": "medium", "pattern": "CALCULATE_FILTER"
         }
 
-    # Pattern 2: (sum(A)/sum(B))*100
-    pct = re.match(
-        r'\(sum\(\[([^\]]+)\]\)\s*/\s*sum\(\[([^\]]+)\]\)\)\s*\*\s*100',
-        readable.strip(), re.IGNORECASE
-    )
-    if pct:
-        return {
-            "dax": f"DIVIDE([{pct.group(1)}], [{pct.group(2)}]) * 100",
-            "note": "DIVIDE() avoids /0 errors.",
-            "confidence": "high"
-        }
-
-    # Pattern 3: sum(A)+sum(B)
-    add = re.match(
-        r'sum\(\[([^\]]+)\]\)\s*\+\s*sum\(\[([^\]]+)\]\)',
-        readable.strip(), re.IGNORECASE
-    )
-    if add:
-        return {
-            "dax": f"[{add.group(1)}] + [{add.group(2)}]",
-            "note": "Direct measure sum.",
-            "confidence": "high"
-        }
-
-    # General function substitution
+    # ── General fallback substitution ─────────────────────────────────────────
     dax = readable
-    DAX_MAP = {
+    SIMPLE_MAP = {
         r'\bAVG\(':       'AVERAGE(',
         r'\bCOUNTD\(':    'DISTINCTCOUNT(',
-        r'\bCOUNT\(':     'COUNT(',
         r'\bIFNULL\(':    'IF(ISBLANK(',
         r'\bZN\(':        'IF(ISBLANK(',
         r'\bISNULL\(':    'ISBLANK(',
         r'\bIIF\(':       'IF(',
         r'\bCONTAINS\(':  'CONTAINSSTRING(',
-        r'\bRANK\(':      'RANKX(ALL(Table), ',
     }
-    for pat, repl in DAX_MAP.items():
+    for pat, repl in SIMPLE_MAP.items():
         dax = re.sub(pat, repl, dax, flags=re.IGNORECASE)
-    dax = re.sub(r'\bsum\(\[([^\]]+)\]\)', r'SUM([\1])', dax, flags=re.IGNORECASE)
-    dax = re.sub(r'\bIF\s+(.+?)\s+then\s+(.+?)\s+end',
-                 r'IF(\1, \2, BLANK())', dax, flags=re.IGNORECASE)
+    dax = re.sub(r'\bIF\s+(.+?)\s+THEN\s+(.+?)\s+END',
+                 r'IF(\1, \2, BLANK())', dax, flags=re.IGNORECASE | re.DOTALL)
 
     changed = dax.strip() != readable.strip()
     return {
         "dax": dax.strip(),
-        "note": "Review required — complex formula." if changed else "Manual conversion needed.",
-        "confidence": "medium" if changed else "low"
+        "note": "Partial substitution — review required." if changed else "Manual conversion needed.",
+        "confidence": "medium" if changed else "low",
+        "pattern": "FALLBACK"
     }
 
 
@@ -182,13 +396,8 @@ def _build_cols_alias_map(root: etree._Element) -> dict:
         parts = re.match(r'\[?([^\]]+)\]?\.\[?([^\]]+)\]?', val.strip())
         if parts and key:
             table_raw = parts.group(1).strip()
-            # Strip trailing GUID suffix from hyper extract table names
-            table_clean = re.sub(r'_[A-Fa-f0-9]{16,}$', '', table_raw)
-            # Handle '!' separated connection-based names (e.g., gcrm!opportunity!202001)
-            if '!' in table_clean:
-                segments = table_clean.split('!')
-                meaningful = [p for p in segments if not re.match(r'^\d+$', p)]
-                table_clean = meaningful[-1] if meaningful else segments[-1]
+            # Normalize using the shared function for consistency with extract_tables
+            table_clean = _normalize_table_name(table_raw)
             alias_map[key] = {
                 "table":  table_clean,
                 "column": parts.group(2).strip(),
@@ -252,7 +461,7 @@ def extract_tables(root, ds_prefixes):
     for rel in root.xpath("//relation[@type='table' or @type='text']"):
         name = rel.get("name", "")
         if re.search(r'_[A-Fa-f0-9]{32}$', name) or "[Extract]." in rel.get("table", ""):
-            # Map back to possible base names (e.g., 'gcrm!opportunity' vs 'gcrm_opportunity')
+            # Normalized form maps back to original for hyper lookup
             base_name = re.sub(r'_[A-Fa-f0-9]{32}$', '', name)
             extract_alias_map[base_name] = name
             extract_alias_map[base_name.replace('!', '_')] = name
@@ -265,10 +474,13 @@ def extract_tables(root, ds_prefixes):
         # Skip extract cache tables for the main list to prevent duplicates
         if re.search(r'_[A-Fa-f0-9]{32}$', name) or "[Extract]." in rel.get("table", ""):
             continue
+
+        # Normalize name consistently across the system
+        normalized = _normalize_table_name(name)
             
-        if name in seen:
+        if normalized in seen:
             continue
-        seen.add(name)
+        seen.add(normalized)
         
         # Match back the hyper table name collected earlier
         hyper_alias = extract_alias_map.get(name, "")
@@ -277,7 +489,8 @@ def extract_tables(root, ds_prefixes):
         
         if rtype == "text":
             tables.append({
-                "name":          name,
+                "name":          normalized,    # normalized, consistent name
+                "raw_name":      name,          # original XML name for debugging
                 "source":        rel.get("table", ""),
                 "type":          "custom_sql",
                 "sql":           (rel.text or "").strip(),
@@ -289,7 +502,8 @@ def extract_tables(root, ds_prefixes):
             alias_keys = root.xpath(f"//cols/map[contains(@value,'[{name}].')]/@key")
             aliases = [k.strip("[]") for k in alias_keys if k.strip("[]") not in cols]
             tables.append({
-                "name":            name,
+                "name":            normalized,  # normalized, consistent name
+                "raw_name":        name,        # original XML name for debugging
                 "source":          rel.get("table", ""),
                 "type":            "table",
                 "columns":         cols,
@@ -351,6 +565,17 @@ def extract_relationships(root, ds_prefixes):
     Separate from physical joins. Lives under <_.fcp.ObjectModelTableType> or <model><relationships>.
     """
     relationships = []
+
+    def _table_from_oid(ep):
+        """
+        Extract a clean, normalized table name from an endpoint object-id attribute.
+        Uses _normalize_table_name() for consistency with extract_tables output.
+        """
+        if ep is None:
+            return ""
+        oid = ep.get("object-id", "")
+        return _normalize_table_name(oid)
+
     for rel in root.xpath("//*[local-name()='relationships']/*[local-name()='relationship']"):
         expr = rel.find("expression")
         left_col = right_col = ""
@@ -359,14 +584,13 @@ def extract_relationships(root, ds_prefixes):
             if len(ops) >= 2:
                 left_col  = _clean_field(ops[0].get("op", ops[0].text or ""), ds_prefixes)
                 right_col = _clean_field(ops[1].get("op", ops[1].text or ""), ds_prefixes)
+
+        # Bug 4 fix: strip Tableau UI disambiguation suffix e.g. 'Account Executive (Fees)' → 'Account Executive'
+        left_col  = re.sub(r'\s+\([^)]+\)$', '', left_col).strip()
+        right_col = re.sub(r'\s+\([^)]+\)$', '', right_col).strip()
+
         fp = rel.find("first-end-point")
         sp = rel.find("second-end-point")
-        # object-id often looks like 'TableName_GUID'
-        def _table_from_oid(ep):
-            if ep is None: return ""
-            oid = ep.get("object-id","")
-            # strip trailing _GUID
-            return re.sub(r'_[A-Za-z0-9]{8,}$', '', oid)
         relationships.append({
             "table1":              _table_from_oid(fp),
             "table2":              _table_from_oid(sp),
@@ -377,6 +601,7 @@ def extract_relationships(root, ds_prefixes):
             "note":                "Verify cardinality before building Power BI data model"
         })
     return relationships
+
 
 
 def extract_columns(root, ds_prefixes, caption_map, alias_map=None):
@@ -419,7 +644,9 @@ def extract_columns(root, ds_prefixes, caption_map, alias_map=None):
     return columns
 
 
-def extract_lod_calculations(root, caption_map, alias_map=None):
+def extract_lod_calculations(root, caption_map, alias_map=None,
+                             model_type: str = "FLAT",
+                             cardinality: str = "many-to-one"):
     """5. LOD (fixed/include/exclude) calculations with DAX hints."""
     alias_map = alias_map or {}
     lods = []
@@ -434,7 +661,9 @@ def extract_lod_calculations(root, caption_map, alias_map=None):
             continue
         seen.add(name)
         readable = _resolve_calc_ids(formula, caption_map)
-        dax_info = _tableau_to_dax(formula, caption_map)
+        dax_info = _tableau_to_dax(formula, caption_map,
+                                   model_type=model_type,
+                                   cardinality=cardinality)
         # Parse LOD type
         lod_type = "FIXED"
         m = re.search(r'\{\s*(FIXED|INCLUDE|EXCLUDE)', formula, re.IGNORECASE)
@@ -447,6 +676,7 @@ def extract_lod_calculations(root, caption_map, alias_map=None):
             "formula":      readable,
             "dax_hint":     dax_info["dax"],
             "dax_note":     dax_info["note"],
+            "dax_pattern":  dax_info.get("pattern", ""),
             "source_tables": _infer_source_tables(formula, alias_map),
         })
     return lods
@@ -1050,6 +1280,12 @@ def extract_tableau_model(twbx_path: str) -> dict:
     # Build alias map once — used by all CF extractors to resolve table names
     alias_map = _build_cols_alias_map(root)
 
+    # Detect model type once — used by DAX conversion logic throughout
+    joins_raw         = extract_joins(root, ds_prefixes)
+    relationships_raw = extract_relationships(root, ds_prefixes)
+    model_type        = detect_model_type(root)
+    cardinality       = _infer_cardinality(relationships_raw)
+
     model = {
         "_meta": {
             "source_file":     str(Path(twbx_path).name),
@@ -1057,16 +1293,22 @@ def extract_tableau_model(twbx_path: str) -> dict:
             "extraction_time": __import__("datetime").datetime.now().isoformat(),
         },
 
+        # ── Model type (JOIN | RELATIONSHIP | FLAT) ────────────────────────
+        "model_type":       model_type,
+        "cardinality":      cardinality,
+
         # ── Source / Connection layer ─────────────────────────────────────
         "connections":      extract_connections(root, ds_prefixes),
         "tables":           extract_tables(root, ds_prefixes),
-        "joins":            extract_joins(root, ds_prefixes),        # physical joins
-        "relationships":    extract_relationships(root, ds_prefixes), # logical model
+        "joins":            joins_raw,                                 # physical joins
+        "relationships":    relationships_raw,                         # logical model
         "blends":           extract_blends(root, ds_prefixes),        # data blending
 
         # ── Semantic / Column layer ───────────────────────────────────────
         "columns":          extract_columns(root, ds_prefixes, caption_map, alias_map),
-        "lod_calcs":        extract_lod_calculations(root, caption_map, alias_map),
+        "lod_calcs":        extract_lod_calculations(root, caption_map, alias_map,
+                                                     model_type=model_type,
+                                                     cardinality=cardinality),
         "table_calcs":      extract_table_calcs(root, caption_map, alias_map),
         "hierarchies":      extract_hierarchies(root, ds_prefixes),
         "groups":           extract_groups(root, ds_prefixes),

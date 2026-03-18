@@ -11,6 +11,7 @@ from storage.migration_store import MigrationStore
 from storage.preview_store import PreviewStore
 from src.tableau.hyper_profiler import HyperDataProfiler
 from src.tableau.tableau_extractor import extract_tableau_model # For fallback profiling if needed
+import re
 
 
 router = APIRouter(prefix="/api/v1/migration", tags=["workbook-metadata"])
@@ -18,6 +19,46 @@ router = APIRouter(prefix="/api/v1/migration", tags=["workbook-metadata"])
 # Initialize stores
 migration_store = MigrationStore()
 preview_store = PreviewStore()
+
+
+def _norm_table(raw: str) -> str:
+    """
+    Normalize a Tableau table name strictly to a unified clean form.
+    Handles 'Extract.Meeting_C95B...', 'gcrm!opportunity!2020...', 'Gcrm_Opportunity_2020...'
+    and also updates field names like 'Product Group (Gcrm_Opportunity_2020...)' -> 'Product Group (Opportunity)'
+    """
+    if not raw or not isinstance(raw, str):
+        return raw
+
+    def clean_table(t: str) -> str:
+        # Strip "Extract." prefix
+        if '.' in t:
+            t = t.split('.')[-1]
+        t = t.strip('"').strip("'")
+        
+        # Strip 32-char GUID or >=8 char GUID
+        t = re.sub(r'_[A-Fa-f0-9]{8,}$', '', t)
+        
+        # If it looks like a Tableau joined/extracted namespace (gcrm!opportunity!timestamp or Gcrm_Opportunity_timestamp)
+        parts = re.split(r'[!_]', t)
+        meaningful = [p for p in parts if not re.match(r'^\d+$', p) and p]
+        
+        if len(meaningful) >= 2 and meaningful[0].lower() in ['gcrm', 'extract', 'logical']:
+            t = meaningful[-1]
+        elif '!' in t:
+            t = meaningful[-1] if meaningful else t
+            
+        # Capitalize gracefully
+        return t.title() if t.islower() else t
+
+    # Handle (TableName) suffix in field/dimension names
+    def _repl_table(match):
+        return f"({clean_table(match.group(1))})"
+
+    if '(' in raw and ')' in raw:
+        return re.sub(r'\(([^)]+)\)', _repl_table, raw)
+
+    return clean_table(raw)
 
 
 # Request model for tableau preview
@@ -68,8 +109,10 @@ async def get_workbook_metadata_summary(migration_id: str):
                 data_sources = model.get("connections", [])
 
                 # Get table names (if profiled during discovery)
-                table_names = [t.get("name") for t in model.get("tables", [])]
-                clean_table_names = [t.get("display_name") or t.get("name") for t in model.get("tables", [])]
+                # Normalize via _norm_table to handle stale DB data with raw ! names or GUID suffixes
+                tables_raw        = model.get("tables", [])
+                table_names       = [_norm_table(t.get("name", "")) for t in tables_raw]
+                clean_table_names = [_norm_table(t.get("display_name") or t.get("name", "")) for t in tables_raw]
 
                 workbooks_summary.append({
                     "workbook_id": workbook.workbook_id,
@@ -518,13 +561,14 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
 
                         if col:
                             # It's a calculated field
+                            calc_display_name = _norm_table(col.get("caption") or display_name)
                             resolved_measures.append({
                                 "type":    "calculated",
-                                "name":    col.get("caption") or display_name,
+                                "name":    calc_display_name,
                                 "formula": col.get("formula", "")
                             })
                             ws_calculated_fields.append({
-                                "name":      col.get("caption") or display_name,
+                                "name":      calc_display_name,
                                 "formula":   col.get("formula", ""),
                                 "calc_type": col.get("formula_type", ""),
                                 "datatype":  col.get("datatype", ""),
@@ -533,10 +577,11 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                         else:
                             # Base field — treat as dimension (could also be base measure,
                             # frontend won't filter on it anyway)
-                            resolved_dimensions.append(display_name)
+                            norm_display = _norm_table(display_name)
+                            resolved_dimensions.append(norm_display)
                             resolved_measures.append({
                                 "type": "base_measure",
-                                "name": display_name
+                                "name": norm_display
                             })
 
                     # Deduplicate dimensions list
@@ -687,7 +732,7 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                                         "nullable": bool(col_profile.null_count > 0)
                                     })
 
-                                display_name = profiler.get_clean_table_name(table)
+                                display_name = _norm_table(profiler.get_clean_table_name(table))
                                 workbook_tables.append({
                                     "table_name": str(table),
                                     "display_name": display_name,

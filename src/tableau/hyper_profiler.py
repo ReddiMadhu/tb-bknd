@@ -85,34 +85,31 @@ class HyperDataProfiler:
     def normalize_hyper_table_name(raw_name: str) -> str:
         """
         Normalize a Tableau Hyper table name to a clean, human-readable form.
-
-        Handles:
-        - Schema prefix:  '"Extract"."Fees_762A..."' → 'Fees'
-        - UUID suffix:    'Meeting_C95B177F...41D3A' → 'Meeting'
-        - Multi-word:     'Individual Budget_B25F...' → 'Individual Budget'
-        - Connection `!`:  'gcrm!opportunity!202001231041_90E...' → 'opportunity'
+        Handles 'Extract.Meeting_C95B...', 'gcrm!opportunity!2020...'
         """
-        name = raw_name
+        if not raw_name or not isinstance(raw_name, str):
+            return raw_name
 
+        t = raw_name
         # 1. Strip schema prefix (e.g. '"Extract"."Table"' → 'Table')
-        if '.' in name:
-            name = name.split('.')[-1]
-        name = name.strip('"').strip("'")
-
-        # 2. Strip 32-char hex UUID suffix (e.g. _B25F7F09...)
-        name = re.sub(r'_[A-Fa-f0-9]{32}$', '', name)
-
-        # 3. Handle '!' separated connection-based names
-        #    e.g. 'gcrm!opportunity!202001231041' → 'opportunity'
-        if '!' in name:
-            parts = name.split('!')
-            # The actual table name is typically the second segment
-            # Filter out pure numeric/timestamp segments
-            meaningful = [p for p in parts if not re.match(r'^\d+$', p)]
-            name = meaningful[-1] if meaningful else parts[-1]
-
-        # 4. If after all cleaning we end up with just 'Extract', return as-is
-        return name.strip()
+        if '.' in t:
+            t = t.split('.')[-1]
+        t = t.strip('"').strip("'")
+        
+        # 2. Strip 32-char GUID or >=8 char GUID
+        t = re.sub(r'_[A-Fa-f0-9]{8,}$', '', t)
+        
+        # 3. Handle '!' separated connection-based names or '_' joined names
+        parts = re.split(r'[!_]', t)
+        meaningful = [p for p in parts if not re.match(r'^\d+$', p) and p]
+        
+        if len(meaningful) >= 2 and meaningful[0].lower() in ['gcrm', 'extract', 'logical']:
+            t = meaningful[-1]
+        elif '!' in t:
+            t = meaningful[-1] if meaningful else t
+            
+        # 4. Capitalize gracefully
+        return t.title() if t.islower() else t
 
     def get_clean_table_name(self, raw_table_name: str) -> str:
         """Get the normalized name for a raw Hyper table name."""

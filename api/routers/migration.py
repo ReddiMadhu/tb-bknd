@@ -1552,143 +1552,102 @@ async def get_table_classifications(migration_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _norm_table(raw: str) -> str:
+    """
+    Normalize a Tableau table name strictly to a unified clean form.
+    Handles 'Extract.Meeting_C95B...', 'gcrm!opportunity!2020...', 'Gcrm_Opportunity_2020...'
+    and also updates field names like 'Product Group (Gcrm_Opportunity_2020...)' -> 'Product Group (Opportunity)'
+    """
+    if not raw or not isinstance(raw, str):
+        return raw
+
+    import re
+    def clean_table(t: str) -> str:
+        # Strip "Extract." prefix
+        if '.' in t:
+            t = t.split('.')[-1]
+        t = t.strip('"').strip("'")
+        
+        # Strip 32-char GUID or >=8 char GUID
+        t = re.sub(r'_[A-Fa-f0-9]{8,}$', '', t)
+        
+        # If it looks like a Tableau joined/extracted namespace (gcrm!opportunity!timestamp or Gcrm_Opportunity_timestamp)
+        parts = re.split(r'[!_]', t)
+        meaningful = [p for p in parts if not re.match(r'^\d+$', p) and p]
+        
+        if len(meaningful) >= 2 and meaningful[0].lower() in ['gcrm', 'extract', 'logical']:
+            t = meaningful[-1]
+        elif '!' in t:
+            t = meaningful[-1] if meaningful else t
+            
+        # Capitalize gracefully
+        return t.title() if t.islower() else t
+
+    # Handle (TableName) suffix in field/dimension names
+    def _repl_table(match):
+        return f"({clean_table(match.group(1))})"
+
+    if '(' in raw and ')' in raw:
+        return re.sub(r'\(([^)]+)\)', _repl_table, raw)
+
+    return clean_table(raw)
+
+
 @router.get("/{migration_id}/suggested-relationships")
 async def get_suggested_relationships(migration_id: str):
     """
     Get suggested relationships for Page 2 - Model Intelligence
-
-    Uses the existing RelationshipDiscovery component to detect relationships
-    between tables based on column names and data overlap.
-
-    Returns:
-        {
-            "relationships": [
-                {
-                    "from_table": "Sales",
-                    "from_column": "customer_id",
-                    "to_table": "Customers",
-                    "to_column": "id",
-                    "relationship_type": "MANY_TO_ONE",
-                    "confidence_score": 95,
-                    "detection_method": "EXACT_MATCH",
-                    "data_overlap": 98
-                }
-            ]
-        }
+    
+    Reads natively extracted joins and logical relationships from Tableau workbook.
+    Table names are normalized at response time to handle stale DB data.
     """
     try:
-        from src.relationship_detector import RelationshipDetector
-        from src.tableau.hyper_profiler import HyperDataProfiler
-
         workbooks = migration_store.get_workbooks_by_migration(migration_id)
 
         if not workbooks:
             return {"relationships": []}
 
-        # Collect all tables from all workbooks
-        all_tables_data = []
-
-        for workbook in workbooks:
-            # Hyper paths are stored in raw_model['hyper_files'] (set by orchestrator Phase 1)
-            raw_model = workbook.raw_model or {}
-            # Use hyper_files list for robust detection
-            hyper_files = raw_model.get("hyper_files", [])
-            
-            # If hyper_files is empty, fallback to connections (legacy support)
-            if not hyper_files:
-                for conn in raw_model.get("connections", []):
-                    if conn.get("type") in ("hyper", "federated") and conn.get("filename"):
-                        hyper_files.append(conn.get("filename"))
-
-            for hyper_path in hyper_files:
-                if not hyper_path or not str(hyper_path).endswith(".hyper"):
-                    continue
-                try:
-                    profiler = HyperDataProfiler(str(hyper_path))
-                    tables = profiler.list_tables()
-
-                    for table in tables:
-                        df = profiler.read_table(table, limit=10000)
-                        all_tables_data.append({
-                            "name": profiler.get_clean_table_name(table),
-                            "data": df
-                        })
-
-                except Exception as e:
-                    logger.error(f"Failed to load table data from {hyper_path}: {e}")
-                    continue
-
-        if not all_tables_data:
-            logger.warning(f"No table data found for migration {migration_id} — no hyper files or all failed")
-            return {"relationships": []}
-
-        # Build profiles + dataframes dicts for RelationshipDetector
-        profiles: dict = {}   # {table_name: {columns: {col_name: profile_dict}}}
-        dataframes: dict = {} # {table_name: pd.DataFrame}
-
-        for td in all_tables_data:
-            table_name = td["name"]
-            df = td["data"]
-            if df is None or df.empty:
-                continue
-
-            col_profiles = {}
-            for col in df.columns:
-                series = df[col].dropna()
-                n_unique = series.nunique()
-                n_total = len(series)
-                null_pct = (df[col].isna().sum() / len(df)) * 100 if len(df) else 0
-                unique_pct = (n_unique / n_total * 100) if n_total else 0
-
-                # Infer basic data type
-                dtype = str(df[col].dtype)
-                if "int" in dtype or "float" in dtype:
-                    data_type = "numeric"
-                elif "datetime" in dtype or "date" in dtype:
-                    data_type = "datetime"
-                else:
-                    data_type = "string"
-
-                import re as _re
-                normalized = _re.sub(r'[^a-z0-9]', '', col.lower())
-                col_profiles[col] = {
-                    "data_type": data_type,
-                    "normalized_name": normalized,
-                    "name_variations": [normalized],
-                    "cardinality": n_unique,
-                    "null_percent": null_pct,
-                    "unique_percent": unique_pct,
-                    "key_features": {
-                        "is_unique": n_unique == n_total and n_total > 0,
-                    },
-                }
-
-            profiles[table_name] = {"columns": col_profiles}
-            dataframes[table_name] = df
-
-        if len(profiles) < 2:
-            logger.info(f"Only {len(profiles)} table(s) — cannot detect cross-table relationships")
-            return {"relationships": []}
-
-        # Run relationship detection
-        detector = RelationshipDetector(profiles=profiles, dataframes=dataframes)
-        candidates = detector.generate_candidates()
-
-        # Format for frontend — map RelationshipCandidate fields
         formatted_relationships = []
-        for cand in candidates:
-            formatted_relationships.append({
-                "from_table": cand.source_file,
-                "from_column": cand.source_column,
-                "to_table": cand.target_file,
-                "to_column": cand.target_column,
-                "relationship_type": cand.relationship_type,
-                "confidence_score": cand.confidence_score,
-                "detection_method": cand.detection_method,
-                "data_overlap": cand.statistics.get("value_overlap_percent", 0),
-            })
+        for workbook in workbooks:
+            model = workbook.raw_model or {}
+            
+            # Extract Joins — normalize table names for stale DB data
+            joins = model.get("joins", [])
+            for j in joins:
+                lt = _norm_table(j.get("left_table", "") or "")
+                rt = _norm_table(j.get("right_table", "") or "")
+                lc = j.get("left_column", "")
+                rc = j.get("right_column", "")
+                formatted_relationships.append({
+                    "relationship_id": f"{lt}_{lc}_{rt}_{rc}",
+                    "source": {"file": lt, "column": lc},
+                    "target": {"file": rt, "column": rc},
+                    "relationship_type": j.get("join_type", "INNER_JOIN"),
+                    "confidence_score": None,
+                    "confidence_level": None,
+                    "detection_method": "TABLEAU_PARSER",
+                    "deleted": False
+                })
 
-        logger.info(f"✅ Detected {len(formatted_relationships)} relationships for {migration_id}")
+            # Extract Relationships — normalize table names for stale DB data
+            rels = model.get("relationships", [])
+            for r in rels:
+                t1 = _norm_table(r.get("table1", "") or "")
+                t2 = _norm_table(r.get("table2", "") or "")
+                c1 = r.get("table1_column", "")
+                c2 = r.get("table2_column", "")
+                formatted_relationships.append({
+                    "relationship_id": f"{t1}_{c1}_{t2}_{c2}",
+                    "source": {"file": t1, "column": c1},
+                    "target": {"file": t2, "column": c2},
+                    "relationship_type": r.get("relationship_type", "MANY_TO_ONE"),
+                    "confidence_score": None,
+                    "confidence_level": None,
+                    "detection_method": "TABLEAU_PARSER",
+                    "deleted": False
+                })
+
+        logger.info(f"Returned {len(formatted_relationships)} relationships for {migration_id} from Tableau parser")
         return {"relationships": formatted_relationships}
 
     except Exception as e:
