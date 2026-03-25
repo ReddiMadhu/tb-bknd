@@ -21,6 +21,55 @@ migration_store = MigrationStore()
 preview_store = PreviewStore()
 
 
+def _resolve_hyper_path(model: dict, migration_id: Optional[str] = None) -> Optional[str]:
+    """
+    Robustly resolve the path to a .hyper file for a given workbook model.
+    Handles old cache, missing files, and temp paths.
+    """
+    import os
+    from pathlib import Path
+    
+    # Optional typing import done globally or locally
+    # Pyre complains about api.config missing from path analysis,
+    # but the API app runs from root where 'api' is a module.
+    from api.config import config
+    
+    potential_paths = []
+    
+    # 1. Check hyper_files list stored by migration orchestrator
+    for hf in model.get("hyper_files", []):
+        if hf and str(hf).endswith(".hyper"):
+            potential_paths.append(str(hf))
+            
+    # 2. Check connections info
+    for conn in model.get("connections", []):
+        if conn.get("type") in ("hyper", "federated") and conn.get("filename"):
+            potential_paths.append(str(conn.get("filename")))
+            
+    # 3. Check tables metadata
+    for t in model.get("tables", []):
+        if t.get("source") and ".hyper" in t.get("source"):
+            potential_paths.append(str(t.get("source")))
+            
+    # Verify paths exist
+    for path in potential_paths:
+        if os.path.exists(path):
+            return path
+            
+    # 4. Fallback for static/old cache demos: Search in data/uploads
+    try:
+        uploads_dir = Path(config.UPLOAD_DIR)
+        if uploads_dir.exists():
+            for f in uploads_dir.glob("*.hyper"):
+                if f.is_file():
+                    logger.warning(f"Using fallback hyper file found in uploads: {f}")
+                    return str(f)
+    except Exception as e:
+        logger.error(f"Error checking fallback hyper files: {e}")
+
+    return None
+
+
 def _norm_table(raw: str) -> str:
     """
     Normalize a Tableau table name strictly to a unified clean form.
@@ -284,22 +333,9 @@ async def get_table_details(migration_id: str, workbook_id: str, table_name: str
         if not workbook:
             raise HTTPException(status_code=404, detail="Workbook not found")
 
-        # Find hyper files from model or connection info
+        # Find hyper files from model or fallback locations
         model = workbook.raw_model or {}
-        hyper_path = None
-        for conn in model.get("connections", []):
-            if conn.get("type") in ("hyper", "federated"):
-                if conn.get("filename"):
-                    # Check if file exists relative to workbook or extracted
-                    hyper_path = conn.get("filename")
-                    break
-
-        if not hyper_path:
-            # Fallback: check if we have it in the tables metadata
-            for t in model.get("tables", []):
-                if t.get("source") and ".hyper" in t.get("source"):
-                    hyper_path = t.get("source")
-                    break
+        hyper_path = _resolve_hyper_path(model, migration_id)
 
         if not hyper_path:
             raise HTTPException(status_code=404, detail="No Hyper files paths found in metadata")
@@ -730,19 +766,8 @@ async def get_comprehensive_workbook_metadata(migration_id: str):
                 workbook_tables = []
                 hyper_path_str = None
 
-                # Primary: hyper_files list stored by migration orchestrator in Phase 1
-                hyper_files_list = model.get("hyper_files", [])
-                for hf in hyper_files_list:
-                    if hf and str(hf).endswith(".hyper"):
-                        hyper_path_str = str(hf)
-                        break
-
-                # Fallback: old connections-based lookup
-                if not hyper_path_str:
-                    for conn in model.get("connections", []):
-                        if conn.get("type") in ("hyper", "federated") and conn.get("filename"):
-                            hyper_path_str = conn.get("filename")
-                            break
+                # Primary: Use unified resolution helper
+                hyper_path_str = _resolve_hyper_path(model, migration_id)
 
                 logger.info(f"Hyper path resolved: {hyper_path_str}")
 
@@ -1114,24 +1139,9 @@ async def create_tableau_preview(
         # Use first workbook (assuming single workbook migration for now)
         workbook = workbooks[0]
 
-        # Find Hyper file paths from raw_model (pre-parsed during discovery)
+        # Find Hyper file paths from raw_model or fallback cache
         model = workbook.raw_model or {}
-        hyper_files = model.get("hyper_files", [])
-        hyper_path = None
-        
-        if hyper_files:
-            # Use the first valid hyper file found
-            for path in hyper_files:
-                if path and str(path).endswith(".hyper"):
-                    hyper_path = path
-                    break
-        
-        # Fallback to connections if hyper_files is empty (legacy support)
-        if not hyper_path:
-            for conn in model.get("connections", []):
-                if conn.get("type") in ("hyper", "federated") and conn.get("filename"):
-                    hyper_path = conn.get("filename")
-                    break
+        hyper_path = _resolve_hyper_path(model, migration_id)
 
         if not hyper_path:
             raise HTTPException(
@@ -1311,85 +1321,81 @@ async def get_model_intelligence(migration_id: str):
 
         for workbook in workbooks:
             model = workbook.raw_model or {}
-            hyper_files = model.get("hyper_files", [])
+            hyper_path_str = _resolve_hyper_path(model, migration_id)
 
-            if not hyper_files:
-                logger.warning(f"No hyper_files in raw_model for {workbook.filename}")
+            if not hyper_path_str:
+                logger.warning(f"No hyper_path resolved for {workbook.filename}")
                 continue
 
-            for hyper_path in hyper_files:
-                if not hyper_path or not str(hyper_path).endswith(".hyper"):
+            profiler = HyperDataProfiler(str(hyper_path_str))
+            tables = profiler.list_tables()
+
+            for table in tables:
+                table_unquoted = str(table).strip('"').replace('"."', '.')
+                clean_name = profiler.get_clean_table_name(table)
+
+                try:
+                    profile = profiler.profile_table(table_unquoted, sample_size=10000)
+                    row_count = profile.row_count
+                    columns = profile.columns
+                    numeric_cols = [c for c in columns if c.data_type in ["int64", "float64"]]
+                    numeric_density = len(numeric_cols) / len(columns) if columns else 0
+
+                    if row_count > 100000 and numeric_density > 0.5:
+                        classification, confidence = "FACT", 95
+                        reasoning = f"High numeric density ({len(numeric_cols)} cols) and large row count"
+                    elif row_count < 10000 and numeric_density < 0.3:
+                        classification, confidence = "DIMENSION", 98
+                        reasoning = f"Low numeric density ({len(numeric_cols)} cols) and small row count"
+                    else:
+                        classification, confidence = "DIMENSION", 70
+                        reasoning = f"Mixed (rows: {row_count}, numeric: {len(numeric_cols)})"
+
+                    duplicate_count = profiler.detect_duplicates(table_unquoted, sample_size=10000)
+                    duplicate_rate = (duplicate_count / row_count * 100) if row_count > 0 else 0
+                    quality_status = "good" if duplicate_rate < 1 else "warning"
+
+                    pk_column, pk_uniqueness = None, 0
+                    for col in columns:
+                        if col.cardinality >= 0.99:
+                            pk_column = str(col.column_name)
+                            pk_uniqueness = round(col.cardinality * 100, 1)
+                            break
+
+                    column_details = [{
+                        "name": str(col.column_name),
+                        "data_type": str(col.data_type),
+                        "nullable": col.null_count > 0,
+                        "cardinality": round(col.cardinality * 100, 1) if hasattr(col, "cardinality") else 0
+                    } for col in columns]
+
+                    result["tables"].append({
+                        "table_name": clean_name,
+                        "row_count": row_count,
+                        "column_count": len(columns),
+                        "column_details": column_details,
+                        "classification": classification,
+                        "confidence_score": confidence,
+                        "numeric_columns": len(numeric_cols),
+                        "reasoning": reasoning,
+                        "duplicate_count": duplicate_count,
+                        "duplicate_rate": round(duplicate_rate, 2),
+                        "status": quality_status,
+                        "potential_primary_key": pk_column,
+                        "pk_uniqueness": pk_uniqueness
+                    })
+
+                    result["summary"]["total_rows"] += row_count
+                    if classification == "FACT":
+                        result["summary"]["fact_tables"] += 1
+                    else:
+                        result["summary"]["dimension_tables"] += 1
+
+                    logger.info(f"Profiled '{clean_name}' - {classification} ({confidence}%)")
+
+                except Exception as table_error:
+                    logger.error(f"Failed to profile table {table}: {table_error}")
                     continue
-
-                profiler = HyperDataProfiler(str(hyper_path))
-                tables = profiler.list_tables()
-
-                for table in tables:
-                    table_unquoted = str(table).strip('"').replace('"."', '.')
-                    clean_name = profiler.get_clean_table_name(table)
-
-                    try:
-                        profile = profiler.profile_table(table_unquoted, sample_size=10000)
-                        row_count = profile.row_count
-                        columns = profile.columns
-                        numeric_cols = [c for c in columns if c.data_type in ["int64", "float64"]]
-                        numeric_density = len(numeric_cols) / len(columns) if columns else 0
-
-                        if row_count > 100000 and numeric_density > 0.5:
-                            classification, confidence = "FACT", 95
-                            reasoning = f"High numeric density ({len(numeric_cols)} cols) and large row count"
-                        elif row_count < 10000 and numeric_density < 0.3:
-                            classification, confidence = "DIMENSION", 98
-                            reasoning = f"Low numeric density ({len(numeric_cols)} cols) and small row count"
-                        else:
-                            classification, confidence = "DIMENSION", 70
-                            reasoning = f"Mixed (rows: {row_count}, numeric: {len(numeric_cols)})"
-
-                        duplicate_count = profiler.detect_duplicates(table_unquoted, sample_size=10000)
-                        duplicate_rate = (duplicate_count / row_count * 100) if row_count > 0 else 0
-                        quality_status = "good" if duplicate_rate < 1 else "warning"
-
-                        pk_column, pk_uniqueness = None, 0
-                        for col in columns:
-                            if col.cardinality >= 0.99:
-                                pk_column = str(col.column_name)
-                                pk_uniqueness = round(col.cardinality * 100, 1)
-                                break
-
-                        column_details = [{
-                            "name": str(col.column_name),
-                            "data_type": str(col.data_type),
-                            "nullable": col.null_count > 0,
-                            "cardinality": round(col.cardinality * 100, 1) if hasattr(col, "cardinality") else 0
-                        } for col in columns]
-
-                        result["tables"].append({
-                            "table_name": clean_name,
-                            "row_count": row_count,
-                            "column_count": len(columns),
-                            "column_details": column_details,
-                            "classification": classification,
-                            "confidence_score": confidence,
-                            "numeric_columns": len(numeric_cols),
-                            "reasoning": reasoning,
-                            "duplicate_count": duplicate_count,
-                            "duplicate_rate": round(duplicate_rate, 2),
-                            "status": quality_status,
-                            "potential_primary_key": pk_column,
-                            "pk_uniqueness": pk_uniqueness
-                        })
-
-                        result["summary"]["total_rows"] += row_count
-                        if classification == "FACT":
-                            result["summary"]["fact_tables"] += 1
-                        else:
-                            result["summary"]["dimension_tables"] += 1
-
-                        logger.info(f"Profiled '{clean_name}' - {classification} ({confidence}%)")
-
-                    except Exception as table_error:
-                        logger.error(f"Failed to profile table {table}: {table_error}")
-                        continue
 
         result["summary"]["total_tables"] = len(result["tables"])
         return result
