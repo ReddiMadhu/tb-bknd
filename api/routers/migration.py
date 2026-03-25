@@ -683,58 +683,55 @@ async def export_powerbi_artifacts(migration_id: str):
             try:
                 workbooks = migration_store.get_workbooks_by_migration(migration_id)
                 for workbook in workbooks:
-                    if workbook.file_path:
-                        try:
-                            parser = TableauTWBParser(workbook.file_path)
+                    model = workbook.raw_model or {}
+                    
+                    # 1. Parse Calculated Fields for Captions
+                    raw_calcs = [c for c in model.get("columns", []) if c.get("formula")]
+                    for cf in raw_calcs:
+                        display_name = cf.get("caption") or cf.get("internal_name")
+                        if cf.get("internal_name"):
+                            replacement_map[cf.get("internal_name")] = display_name
                             
-                            # Parse Calculated Fields for Captions
-                            raw_calcs = parser.parse_calculated_fields()
-                            for cf in raw_calcs:
-                                display_name = cf.caption if cf.caption else cf.name
-                                if cf.name:
-                                    replacement_map[cf.name] = display_name
-                                    
-                            # Parse Worksheets for Analysis
-                            ws_data = parser.parse_worksheets()
-                            workbooks_list.append({
-                                "filename": workbook.filename,
-                                "worksheets": ws_data
-                            })
+                    # 2. Store Worksheets for Analysis
+                    ws_data = model.get("worksheets", [])
+                    workbooks_list.append({
+                        "filename": workbook.filename,
+                        "worksheets": ws_data
+                    })
 
-                            # Profile Data Tables (Hyper Files)
-                            if parser.hyper_files:
+                    # 3. Profile Data Tables (using hyper_files stored in model)
+                    hyper_files = model.get("hyper_files", [])
+                    for hyper_path in hyper_files:
+                        if not hyper_path or not str(hyper_path).endswith(".hyper"):
+                            continue
+                        try:
+                            profiler = HyperDataProfiler(str(hyper_path))
+                            tables = profiler.list_tables()
+                            
+                            for table in tables:
                                 try:
-                                    hyper_path = str(parser.hyper_files[0])
-                                    profiler = HyperDataProfiler(hyper_path)
-                                    tables = profiler.list_tables()
+                                    # Strip quotes for profiling
+                                    table_unquoted = str(table).strip('"').replace('"."', '.')
+                                    # Light profiling
+                                    table_profile = profiler.profile_table(table_unquoted, sample_size=100)
                                     
-                                    for table in tables:
-                                        try:
-                                            # Strip quotes for profiling
-                                            table_unquoted = table.strip('"').replace('"."', '.')
-                                            # Light profiling
-                                            table_profile = profiler.profile_table(table_unquoted, sample_size=100)
-                                            
-                                            # Format columns as: Name (TYPE)
-                                            col_details = [f"{col.column_name} ({col.data_type})" for col in table_profile.columns]
-                                            
-                                            tables_report_data.append({
-                                                "Workbook": workbook.filename,
-                                                "Table Name": table,
-                                                "Row Count": table_profile.row_count,
-                                                "Column Count": len(col_details),
-                                                "Column Names": ", ".join(col_details)
-                                            })
-                                        except Exception as e:
-                                            logger.warning(f"Failed to profile table {table}: {e}")
-                                            
-                                except Exception as e:
-                                    logger.warning(f"Failed to profile hyper file for {workbook.filename}: {e}")
+                                    # Format columns as: Name (TYPE)
+                                    col_details = [f"{col.column_name} ({col.data_type})" for col in table_profile.columns]
+                                    
+                                    tables_report_data.append({
+                                        "Workbook": workbook.filename,
+                                        "Table Name": table,
+                                        "Row Count": table_profile.row_count,
+                                        "Column Count": len(col_details),
+                                        "Column Names": ", ".join(col_details)
+                                    })
+                                except Exception as te:
+                                    logger.warning(f"Failed to profile table {table}: {te}")
+                        except Exception as he:
+                            logger.warning(f"Failed to profile hyper file {hyper_path} for {workbook.filename}: {he}")
 
-                        except Exception as e:
-                            logger.warning(f"Failed to parse workbook {workbook.filename}: {e}")
             except Exception as e:
-                logger.error(f"Failed to build replacment map: {e}")
+                logger.error(f"Failed to build replacement map: {e}")
 
             # Helper to get friendly name
             def get_friendly_name(name):
@@ -1799,7 +1796,6 @@ async def download_conversion_report(
         import pandas as pd
         from io import BytesIO
         import re
-        from src.tableau.twb_parser import TableauTWBParser
 
         # Get conversions
         conversions = migration_store.get_conversions_by_migration(migration_id)
@@ -1816,6 +1812,7 @@ async def download_conversion_report(
         # ---------------------------------------------------------
         # 1. Build Replacement Map (Internal Name -> Caption)
         # ---------------------------------------------------------
+        replacement_map = {}
         try:
             workbooks = migration_store.get_workbooks_by_migration(migration_id)
             for workbook in workbooks:
