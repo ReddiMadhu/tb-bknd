@@ -248,6 +248,7 @@ class MigrationOrchestrator:
                 migration_id=migration_id,
                 conversions=conversions,
                 workbooks_data=workbooks_data,
+                relationships=relationships,
                 progress_callback=progress_callback
             )
         except Exception as e:
@@ -1001,6 +1002,7 @@ class MigrationOrchestrator:
                 migration_id=migration_id,
                 conversions=conversions,
                 workbooks_data=workbooks_data,
+                relationships=relationships,
                 progress_callback=progress_callback
             )
             if pbip_path:
@@ -1127,12 +1129,6 @@ class MigrationOrchestrator:
             worksheets=[ws.get('name', '') if isinstance(ws, dict) else getattr(ws, 'name', '') for ws in all_worksheets]
         )
         param_conversion = self.filter_converter.convert_parameters(all_parameters)
-
-        logger.info(
-            f"Converted {len(powerbi_filters)} filters, "
-            f"{len(param_conversion['whatif_parameters'])} parameters"
-        )
-
         return {
             "filters": powerbi_filters,
             "whatif_parameters": param_conversion["whatif_parameters"],
@@ -1148,54 +1144,24 @@ class MigrationOrchestrator:
         migration_id: str,
         conversions: List[Dict[str, Any]],
         workbooks_data: List[Dict[str, Any]],
+        relationships: List[Relationship],
         progress_callback: Optional[ProgressCallback]
     ) -> Optional[Path]:
         """
         Generate a complete, openable Power BI Project (.pbip) by writing
-        native TMDL text files into a blank template copy.
-
-        Data sources (all already in memory — zero re-opens):
-        - conversions        : each dict has calc_name + dax_result.dax_formula
-        - self._hyper_profilers : cached open profilers from Phase 1
-        - workbooks_data     : each wb dict has hyper_files list
-
-        Output layout
-        -------------
-        exports/{migration_id}/pbip_output/
-            template.pbip
-            template.SemanticModel/
-                definition/
-                    model.tmdl          ← blank header + injected ref table lines
-                    database.tmdl
-                    tables/
-                        <TableName>.tmdl   (one per Hyper table)
-                        MeasuresTable.tmdl (all DAX measures)
-            template.Report/
-                definition.pbir
+        native TMDL text files dynamically.
         """
         import re
         import shutil
         import pandas as pd
-        from src.powerbi.pbip_tmdl_injector import PBIPTmdlInjector
+        from src.powerbi.pbip_generator import PBIPGenerator
 
-        logger.info("📄 Generating PBIP project via TMDL injection...")
-
-        # ── 1. Copy blank template → fresh output directory ─────────────────
-        template_dir = (
-            Path(__file__).resolve().parent.parent
-            / "powerbi" / "templates" / "blank_pbip"
-        )
-        if not template_dir.exists():
-            logger.error(f"❌ Blank PBIP template not found at: {template_dir}")
-            return None
+        logger.info("📄 Generating PBIP project programmatically...")
 
         output_dir = Path("exports") / migration_id / "pbip_output"
         if output_dir.exists():
             shutil.rmtree(output_dir)   # clean slate on re-run
-        shutil.copytree(template_dir, output_dir)
-        logger.info(f"  ✓ Template copied to: {output_dir}")
-
-        sm_folder = output_dir / "template.SemanticModel"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         # ── 2. Collect DataFrames from already-cached Hyper profilers ────────
         tables: Dict[str, pd.DataFrame] = {}
@@ -1248,6 +1214,7 @@ class MigrationOrchestrator:
                     raw_model = json.loads(raw_model)
                 except Exception:
                     raw_model = {}
+
             raw_calcs = [c for c in raw_model.get("columns", []) if c.get("formula")]
             for cf in raw_calcs:
                 display_name = cf.get("caption") or cf.get("internal_name")
@@ -1365,25 +1332,21 @@ class MigrationOrchestrator:
 
         logger.info(f"  ✓ {len(measures)} measure(s) prepared for PBIP")
 
-        # ── 4. Inject TMDL files ──────────────────────────────────────────────
-        if not tables and not measures:
-            logger.warning("  ⚠ No tables or measures to inject — PBIP will be empty")
-
+        # ── 4. Generate dynamically using PBIPGenerator ───────────────────────────
         try:
-            injector = PBIPTmdlInjector()
-            injected = injector.inject(
-                sm_folder=sm_folder,
+            generator = PBIPGenerator(project_name="template", output_dir=output_dir)
+            generator.generate(
                 tables=tables,
-                measures=measures,
+                relationships=relationships,
+                measures=measures
             )
             logger.info(
-                f"  ✅ PBIP injection complete: "
-                f"{len(injected)} table(s) written to {sm_folder / 'definition' / 'tables'}"
+                f"  ✅ Dynamic PBIP generation complete: "
+                f"{len(tables)} table(s) and {len(relationships)} relationship(s) written to {output_dir}"
             )
         except Exception as e:
-            logger.error(f"  ❌ TMDL injection failed: {e}", exc_info=True)
+            logger.error(f"  ❌ Dynamic PBIP generation failed: {e}", exc_info=True)
             return None
-
         return output_dir
 
     # R4+R2: Removed _export_dax_fallback (never called) and
