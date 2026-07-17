@@ -619,6 +619,269 @@ async def get_validation_results(migration_id: str):
     }
 
 
+def build_migration_excel_report(migration_id: str) -> BytesIO:
+    import pandas as pd
+    from io import BytesIO
+    import re
+    from src.tableau.hyper_profiler import HyperDataProfiler
+    try:
+        from openpyxl.styles import Font
+    except ImportError:
+        Font = None
+
+    # Get conversions & calculations
+    conversions = migration_store.get_conversions_by_migration(migration_id)
+    calculations = migration_store.get_calculations_by_migration(migration_id)
+    calc_map = {c.calc_id: c for c in calculations}
+
+    # Build Replacement Map (Internal Name -> Caption)
+    replacement_map = {}
+    workbooks_list = []
+    
+    # New collections for relationships
+    relationships_sheet_data = []
+
+    try:
+        workbooks = migration_store.get_workbooks_by_migration(migration_id)
+        for workbook in workbooks:
+            model = workbook.raw_model or {}
+
+            # Build caption replacement map from raw_model columns
+            raw_calcs = [c for c in model.get("columns", []) if c.get("formula")]
+            for cf in raw_calcs:
+                display_name = cf.get("caption") or cf.get("internal_name")
+                if cf.get("internal_name"):
+                    replacement_map[cf.get("internal_name")] = display_name
+
+            # Store worksheets for analysis
+            ws_data = model.get("worksheets", [])
+            workbooks_list.append({
+                "filename": workbook.filename,
+                "worksheets": ws_data
+            })
+            
+            # Extract relationships
+            for r in model.get("relationships", []):
+                relationships_sheet_data.append({
+                    "Workbook": workbook.filename,
+                    "Table 1": r.get("table1", ""),
+                    "Table 2": r.get("table2", ""),
+                    "Table 1 Column": r.get("table1_column", ""),
+                    "Table 2 Column": r.get("table2_column", ""),
+                    "Relationship Type": r.get("relationship_type", ""),
+                    "Cardinality": r.get("cardinality", "")
+                })
+    except Exception as e:
+        logger.error(f"Failed to build replacement map or read workbook structure: {e}")
+
+    # Helper to get friendly name
+    def get_friendly_name(name):
+        return replacement_map.get(name, name)
+
+    # Helper to clean formulas
+    sorted_keys = sorted(replacement_map.keys(), key=len, reverse=True)
+    def replace_names(formula):
+        if not formula: return ""
+        updated = formula
+        for internal in sorted_keys:
+            readable = replacement_map[internal]
+            escaped_internal = re.escape(internal)
+            updated = re.sub(f"\\[{escaped_internal}\\]", f"[{readable}]", updated)
+            updated = re.sub(f"\\b{escaped_internal}\\b", readable, updated)
+        return updated
+
+    # --- 1. BUILD DAX CONVERSION SHEET DATA ---
+    dax_report_data = []
+    for conv in conversions:
+        calc = calc_map.get(conv.calc_id)
+        if calc:
+            # Determine Validation Status
+            if (conv.confidence_score or 0) > 0.95:
+                validation_status = "Passed"
+            else:
+                if conv.status.value == "validated": validation_status = "Passed"
+                elif conv.status.value == "failed": validation_status = "Failed"
+                else: validation_status = "Manual Review"
+
+            friendly_name = get_friendly_name(calc.calc_name)
+            
+            dax_report_data.append({
+                "Calculated Field": friendly_name,
+                "Tableau Formula": replace_names(calc.calc_formula),
+                "DAX Formula": replace_names(conv.dax_formula),
+                "Validation Test": validation_status
+            })
+
+    # --- 2. BUILD WORKSHEET ANALYSIS SHEET DATA ---
+    worksheet_report_data = []
+    for wb_data in workbooks_list:
+        filename = wb_data['filename']
+        for ws in wb_data['worksheets']:
+            ws_name = ws.get("name", "")
+            visual_type = ws.get("mark_type") or ws.get("chart_type", "Automatic")
+
+            rows_fields = ws.get("rows_fields", []) or ws.get("rows", [])
+            cols_fields = ws.get("columns_fields", []) or ws.get("cols", [])
+            rows_str = ", ".join(get_friendly_name(str(r)) for r in rows_fields if r) or "-"
+            cols_str = ", ".join(get_friendly_name(str(c)) for c in cols_fields if c) or "-"
+
+            raw_dims = ws.get("dimensions", [])
+            dimensions = [get_friendly_name(d) for d in raw_dims if d]
+
+            measures_raw = ws.get("measures", [])
+            calc_fields_list = ws.get("calculated_fields", [])
+            all_measures = []
+            calc_names = []
+            base_names = []
+            for m in measures_raw:
+                m_name = m.get("name") if isinstance(m, dict) else str(m)
+                m_type = m.get("type", "") if isinstance(m, dict) else ""
+                friendly = get_friendly_name(m_name)
+                all_measures.append(friendly)
+                if m_type == "calculated":
+                    calc_names.append(friendly)
+                else:
+                    base_names.append(friendly)
+
+            if not calc_names and calc_fields_list:
+                for cf in calc_fields_list:
+                    cf_name = cf.get("name") if isinstance(cf, dict) else str(cf)
+                    friendly = get_friendly_name(cf_name)
+                    calc_names.append(friendly)
+                    all_measures.append(friendly)
+
+            filters_raw = ws.get("filters", [])
+            filter_fields = [get_friendly_name(f.get("field", "")) for f in filters_raw if isinstance(f, dict) and f.get("field")]
+            filters_str = ", ".join(filter_fields) if filter_fields else "-"
+
+            calc_details = []
+            for cf in calc_fields_list:
+                if isinstance(cf, dict):
+                    cf_name = get_friendly_name(cf.get("name", ""))
+                    cf_formula = cf.get("formula", "")
+                    if cf_name:
+                        calc_details.append(f"{cf_name}: {cf_formula}" if cf_formula else cf_name)
+
+            worksheet_report_data.append({
+                "Workbook": filename,
+                "Worksheet Name": ws_name,
+                "Chart Type": visual_type,
+                "Rows Shelf": rows_str,
+                "Columns Shelf": cols_str,
+                "Dimensions": ", ".join(dimensions) if dimensions else "-",
+                "All Measures": ", ".join(all_measures) if all_measures else "-",
+                "Calculated Fields": ", ".join(calc_names) if calc_names else "-",
+                "Calculated Field Formulas": " | ".join(calc_details) if calc_details else "-",
+                "Base Measures": ", ".join(base_names) if base_names else "-",
+                "Filters": filters_str,
+            })
+
+    # --- 3. WRITE EXCEL FILE ---
+    excel_buffer = BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+        # Sheet 1: DAX Conversions
+        df_dax = pd.DataFrame(dax_report_data)
+        df_dax.to_excel(writer, sheet_name='DAX Conversions', index=False)
+        
+        # Sheet 2: Worksheet Analysis
+        df_ws = pd.DataFrame(worksheet_report_data)
+        df_ws.to_excel(writer, sheet_name='Worksheet Analysis', index=False)
+
+        # Sheet 3: Tables & Columns (with sample 5 rows stacked vertically)
+        sample_sheet_name = "Tables & Columns"
+        current_row = 0
+        
+        try:
+            workbooks = migration_store.get_workbooks_by_migration(migration_id)
+            for workbook in workbooks:
+                model = workbook.raw_model or {}
+                
+                # Light profile tables
+                table_sample_dfs = {}
+                hyper_files = model.get("hyper_files", [])
+                for hyper_path in hyper_files:
+                    if not hyper_path or not str(hyper_path).endswith(".hyper"):
+                        continue
+                    try:
+                        profiler = HyperDataProfiler(str(hyper_path))
+                        tables = profiler.list_tables()
+                        for t_name in tables:
+                            try:
+                                t_unquoted = str(t_name).strip('"').replace('"."', '.')
+                                df_sample = profiler.read_table(t_unquoted, limit=5)
+                                if df_sample is not None and not df_sample.empty:
+                                    clean_name = profiler.get_clean_table_name(t_name)
+                                    table_sample_dfs[clean_name] = df_sample
+                                    table_sample_dfs[t_unquoted] = df_sample
+                                    table_sample_dfs[t_name] = df_sample
+                            except Exception as te:
+                                logger.warning(f"Failed to read table {t_name} from hyper: {te}")
+                    except Exception as he:
+                        logger.warning(f"Failed to load hyper file {hyper_path}: {he}")
+                
+                for t in model.get("tables", []):
+                    logical_name = t.get("name", "")
+                    raw_name = t.get("raw_name", "")
+                    hyper_alias = t.get("hyper_alias", "")
+                    
+                    df_sample = None
+                    for key in [hyper_alias, logical_name, raw_name]:
+                        if key and key in table_sample_dfs:
+                            df_sample = table_sample_dfs[key]
+                            break
+                    
+                    if df_sample is None:
+                        cols = t.get("columns", [])
+                        clean_cols = [get_friendly_name(c) for c in cols if c]
+                        df_sample = pd.DataFrame(columns=clean_cols if clean_cols else ["No columns defined"])
+                    else:
+                        df_sample = df_sample.copy()
+                        df_sample.columns = [get_friendly_name(c) for c in df_sample.columns]
+
+                    if sample_sheet_name not in writer.sheets:
+                        pd.DataFrame().to_excel(writer, sheet_name=sample_sheet_name, index=False)
+                    
+                    ws = writer.sheets[sample_sheet_name]
+                    
+                    # Title text
+                    title_value = f"Table: {logical_name}"
+                    if raw_name and raw_name != logical_name:
+                        title_value += f" ({raw_name})"
+                    
+                    if Font:
+                        cell = ws.cell(row=current_row + 1, column=1, value=title_value)
+                        cell.font = Font(bold=True, size=11, color="1B365D")
+                    else:
+                        ws.cell(row=current_row + 1, column=1, value=title_value)
+                    current_row += 1
+                    
+                    df_sample.to_excel(writer, sheet_name=sample_sheet_name, startrow=current_row, index=False)
+                    current_row += 1 + len(df_sample) + 2
+        except Exception as e:
+            logger.error(f"Failed to build Tables & Columns sheet: {e}")
+
+        # Sheet 4: Table Relationships
+        df_rel = pd.DataFrame(relationships_sheet_data if relationships_sheet_data else [{"Workbook": "-", "Table 1": "-", "Table 2": "-", "Table 1 Column": "-", "Table 2 Column": "-", "Relationship Type": "-", "Cardinality": "-"}])
+        df_rel.to_excel(writer, sheet_name='Table Relationships', index=False)
+
+        # Auto-adjust column widths for all sheets
+        for sheetname in writer.sheets:
+            worksheet = writer.sheets[sheetname]
+            for column in worksheet.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except: pass
+                adjusted_width = min(max_length + 2, 80)
+                worksheet.column_dimensions[column_letter].width = adjusted_width
+
+    excel_buffer.seek(0)
+    return excel_buffer
+
+
 # ============================================
 # Export Endpoints
 # ============================================
@@ -662,184 +925,30 @@ async def export_powerbi_artifacts(migration_id: str):
             migration = migration_store.get_migration(migration_id)
             
             # ---------------------------------------------------------
-            # Generate Excel Report (Combined DAX, Worksheet Analysis, & Data Tables)
+            # Generate Excel Report (Combined DAX, Worksheet Analysis, Tables & Columns, Table Relationships)
             # ---------------------------------------------------------
-            import pandas as pd
-            from io import BytesIO
-            import re
-            from src.tableau.hyper_profiler import HyperDataProfiler
+            excel_buffer = build_migration_excel_report(migration_id)
+            zipf.writestr(f"migration_report_{migration_id}.xlsx", excel_buffer.getvalue())
 
-            # --- 1. PREPARE DATA ---
-            # Get conversions & calculations
+            # Re-fetch conversions and related maps for model.bim generation
             conversions = migration_store.get_conversions_by_migration(migration_id)
             calculations = migration_store.get_calculations_by_migration(migration_id)
             calc_map = {c.calc_id: c for c in calculations}
-            
-            # Build Replacement Map (Internal Name -> Caption)
             replacement_map = {}
-            workbooks_list = [] # Store for worksheet analysis
-            tables_report_data = [] # Store for data tables analysis
-            
             try:
                 workbooks = migration_store.get_workbooks_by_migration(migration_id)
                 for workbook in workbooks:
                     model = workbook.raw_model or {}
-                    
-                    # 1. Parse Calculated Fields for Captions
                     raw_calcs = [c for c in model.get("columns", []) if c.get("formula")]
                     for cf in raw_calcs:
                         display_name = cf.get("caption") or cf.get("internal_name")
                         if cf.get("internal_name"):
                             replacement_map[cf.get("internal_name")] = display_name
-                            
-                    # 2. Store Worksheets for Analysis
-                    ws_data = model.get("worksheets", [])
-                    workbooks_list.append({
-                        "filename": workbook.filename,
-                        "worksheets": ws_data
-                    })
-
-                    # 3. Profile Data Tables (using hyper_files stored in model)
-                    hyper_files = model.get("hyper_files", [])
-                    for hyper_path in hyper_files:
-                        if not hyper_path or not str(hyper_path).endswith(".hyper"):
-                            continue
-                        try:
-                            profiler = HyperDataProfiler(str(hyper_path))
-                            tables = profiler.list_tables()
-                            
-                            for table in tables:
-                                try:
-                                    # Strip quotes for profiling
-                                    table_unquoted = str(table).strip('"').replace('"."', '.')
-                                    # Light profiling
-                                    table_profile = profiler.profile_table(table_unquoted, sample_size=100)
-                                    
-                                    # Format columns as: Name (TYPE)
-                                    col_details = [f"{col.column_name} ({col.data_type})" for col in table_profile.columns]
-                                    
-                                    tables_report_data.append({
-                                        "Workbook": workbook.filename,
-                                        "Table Name": table,
-                                        "Row Count": table_profile.row_count,
-                                        "Column Count": len(col_details),
-                                        "Column Names": ", ".join(col_details)
-                                    })
-                                except Exception as te:
-                                    logger.warning(f"Failed to profile table {table}: {te}")
-                        except Exception as he:
-                            logger.warning(f"Failed to profile hyper file {hyper_path} for {workbook.filename}: {he}")
-
             except Exception as e:
-                logger.error(f"Failed to build replacement map: {e}")
+                logger.error(f"Failed to build replacement map for model.bim: {e}")
 
-            # Helper to get friendly name
             def get_friendly_name(name):
                 return replacement_map.get(name, name)
-
-            # Helper to clean formulas
-            sorted_keys = sorted(replacement_map.keys(), key=len, reverse=True)
-            def replace_names(formula):
-                if not formula: return ""
-                updated = formula
-                for internal in sorted_keys:
-                    readable = replacement_map[internal]
-                    escaped_internal = re.escape(internal)
-                    updated = re.sub(f"\\[{escaped_internal}\\]", f"[{readable}]", updated)
-                    updated = re.sub(f"\\b{escaped_internal}\\b", readable, updated)
-                return updated
-
-            # --- 2. BUILD DAX CONVERSION SHEET DATA ---
-            dax_report_data = []
-            for conv in conversions:
-                calc = calc_map.get(conv.calc_id)
-                if calc:
-                    # Determine Validation Status
-                    if (conv.confidence_score or 0) > 0.95:
-                        validation_status = "Passed"
-                    else:
-                        if conv.status.value == "validated": validation_status = "Passed"
-                        elif conv.status.value == "failed": validation_status = "Failed"
-                        else: validation_status = "Manual Review"
-
-                    friendly_name = get_friendly_name(calc.calc_name)
-                    
-                    dax_report_data.append({
-                        "Calculated Field": friendly_name,
-                        "Tableau Formula": replace_names(calc.calc_formula),
-                        "DAX Formula": replace_names(conv.dax_formula),
-                        "Validation Test": validation_status
-                    })
-
-            # --- 3. BUILD WORKSHEET ANALYSIS SHEET DATA ---
-            worksheet_report_data = []
-            for wb_data in workbooks_list:
-                filename = wb_data['filename']
-                for ws in wb_data['worksheets']:
-                    # Resolve Friendly Names for Lists
-                    dimensions = [get_friendly_name(d) for d in (ws.dimensions or [])]
-                    measures = [get_friendly_name(m.name if hasattr(m, 'name') else m) for m in (ws.measures or [])]
-                    base_measures = [get_friendly_name(m.name) for m in (ws.measures or []) if hasattr(m, 'type') and m.type == 'base_measure']
-                    
-                    # Resolve Axes
-                    # axes is a dictionary, not an object
-                    rows = ws.axes.get('rows') if ws.axes else None
-                    cols = ws.axes.get('columns') if ws.axes else None
-                    
-                    # Fallback logic for Cards (similar to frontend)
-                    if not rows and ws.visual_type.value == 'text' and ws.measures: 
-                         # Roughly mapping text tables/cards
-                         rows = get_friendly_name(ws.measures[0].name if hasattr(ws.measures[0], 'name') else ws.measures[0])
-                    else:
-                        rows = get_friendly_name(rows) if rows else '-'
-
-                    if not cols and ws.visual_type.value == 'text' and ws.dimensions:
-                        cols = get_friendly_name(ws.dimensions[0])
-                    else:
-                        cols = get_friendly_name(cols) if cols else '-'
-
-                    worksheet_report_data.append({
-                        "Workbook": filename,
-                        "Worksheet Name": ws.name,
-                        "Chart Type": ws.visual_type.value if ws.visual_type else "Automatic",
-                        "Dimensions": ", ".join(dimensions),
-                        "Measures": ", ".join(measures),
-                        "Base Measures": ", ".join(base_measures),
-                        "Rows": rows,
-                        "Columns": cols
-                    })
-
-            # --- 4. WRITE EXCEL FILE TO ZIP ---
-            excel_buffer = BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                # Sheet 1: DAX Conversions
-                df_dax = pd.DataFrame(dax_report_data)
-                df_dax.to_excel(writer, sheet_name='DAX Conversions', index=False)
-                
-                # Sheet 2: Worksheet Analysis
-                df_ws = pd.DataFrame(worksheet_report_data)
-                df_ws.to_excel(writer, sheet_name='Worksheet Analysis', index=False)
-
-                # Sheet 3: Data Tables
-                df_tables = pd.DataFrame(tables_report_data)
-                df_tables.to_excel(writer, sheet_name='Data Tables', index=False)
-
-                # Auto-adjust column widths for all sheets
-                for sheetname in writer.sheets:
-                    worksheet = writer.sheets[sheetname]
-                    for column in worksheet.columns:
-                        max_length = 0
-                        column_letter = column[0].column_letter
-                        for cell in column:
-                            try:
-                                if len(str(cell.value)) > max_length:
-                                    max_length = len(str(cell.value))
-                            except: pass
-                        adjusted_width = min(max_length + 2, 80)
-                        worksheet.column_dimensions[column_letter].width = adjusted_width
-
-            excel_buffer.seek(0)
-            zipf.writestr(f"migration_report_{migration_id}.xlsx", excel_buffer.getvalue())
 
             # 5. Add minimal update info (Optional, to keep zip valid if empty)
             zipf.writestr("README.txt", f"Migration Report for {migration_id}\nGenerated: {datetime.now().isoformat()}")
@@ -2081,213 +2190,9 @@ async def download_all_artifacts(migration_id: str):
             migration = migration_store.get_migration(migration_id)
             
             # ---------------------------------------------------------
-            # Generate Excel Report (Combined DAX, Worksheet Analysis, & Data Tables)
+            # Generate Excel Report (Combined DAX, Worksheet Analysis, Tables & Columns, Table Relationships)
             # ---------------------------------------------------------
-            
-            # --- 1. PREPARE DATA ---
-            # Get conversions & calculations
-            conversions = migration_store.get_conversions_by_migration(migration_id)
-            calculations = migration_store.get_calculations_by_migration(migration_id)
-            calc_map = {c.calc_id: c for c in calculations}
-            
-            # Build Replacement Map (Internal Name -> Caption)
-            replacement_map = {}
-            workbooks_list = [] # Store for worksheet analysis
-            tables_report_data = [] # Store for data tables analysis
-            
-            try:
-                workbooks = migration_store.get_workbooks_by_migration(migration_id)
-                for workbook in workbooks:
-                    model = workbook.raw_model or {}
-
-                    # Build caption replacement map from raw_model columns
-                    raw_calcs = [c for c in model.get("columns", []) if c.get("formula")]
-                    for cf in raw_calcs:
-                        display_name = cf.get("caption") or cf.get("internal_name")
-                        if cf.get("internal_name"):
-                            replacement_map[cf.get("internal_name")] = display_name
-
-                    # Store worksheets for analysis
-                    ws_data = model.get("worksheets", [])
-                    workbooks_list.append({
-                        "filename": workbook.filename,
-                        "worksheets": ws_data
-                    })
-
-                    # -------------------------------------------------------
-                    # Profile Data Tables — use hyper_files (set by orchestrator)
-                    # -------------------------------------------------------
-                    hyper_files = model.get("hyper_files", [])
-                    for hyper_path in hyper_files:
-                        if not hyper_path or not str(hyper_path).endswith(".hyper"):
-                            continue
-                        try:
-                            profiler = HyperDataProfiler(str(hyper_path))
-                            tables = profiler.list_tables()
-                            for table in tables:
-                                try:
-                                    table_unquoted = str(table).strip('"').replace('"."', '.')
-                                    clean_name = profiler.get_clean_table_name(table)
-                                    table_profile = profiler.profile_table(table_unquoted, sample_size=100)
-                                    col_details = [
-                                        f"{col.column_name} ({col.data_type})"
-                                        for col in table_profile.columns
-                                    ]
-                                    tables_report_data.append({
-                                        "Workbook": workbook.filename,
-                                        "Table Name": clean_name,
-                                        "Row Count": table_profile.row_count,
-                                        "Column Count": len(col_details),
-                                        "Columns": ", ".join(col_details)
-                                    })
-                                except Exception as te:
-                                    logger.warning(f"Failed to profile table {table}: {te}")
-                        except Exception as he:
-                            logger.warning(f"Failed to profile hyper {hyper_path}: {he}")
-
-            except Exception as e:
-                logger.error(f"Failed to build replacement map: {e}")
-
-            # Helper to get friendly name
-            def get_friendly_name(name):
-                return replacement_map.get(name, name)
-
-            # Helper to clean formulas
-            sorted_keys = sorted(replacement_map.keys(), key=len, reverse=True)
-            def replace_names(formula):
-                if not formula: return ""
-                updated = formula
-                for internal in sorted_keys:
-                    readable = replacement_map[internal]
-                    escaped_internal = re.escape(internal)
-                    updated = re.sub(f"\\[{escaped_internal}\\]", f"[{readable}]", updated)
-                    updated = re.sub(f"\\b{escaped_internal}\\b", readable, updated)
-                return updated
-
-            # --- 2. BUILD DAX CONVERSION SHEET DATA ---
-            dax_report_data = []
-            for conv in conversions:
-                calc = calc_map.get(conv.calc_id)
-                if calc:
-                    # Determine Validation Status
-                    if (conv.confidence_score or 0) > 0.95:
-                        validation_status = "Passed"
-                    else:
-                        if conv.status.value == "validated": validation_status = "Passed"
-                        elif conv.status.value == "failed": validation_status = "Failed"
-                        else: validation_status = "Manual Review"
-
-                    friendly_name = get_friendly_name(calc.calc_name)
-                    
-                    dax_report_data.append({
-                        "Calculated Field": friendly_name,
-                        "Tableau Formula": replace_names(calc.calc_formula),
-                        "DAX Formula": replace_names(conv.dax_formula),
-                        "Validation Test": validation_status
-                    })
-
-            # --- 3. BUILD WORKSHEET ANALYSIS SHEET DATA ---
-            worksheet_report_data = []
-            for wb_data in workbooks_list:
-                filename = wb_data['filename']
-                for ws in wb_data['worksheets']:
-                    # ws is a dict from raw_model['worksheets']
-                    ws_name = ws.get("name", "")
-                    visual_type = ws.get("mark_type") or ws.get("chart_type", "Automatic")
-
-                    # --- Rows / Columns from raw shelf fields ---
-                    rows_fields = ws.get("rows_fields", []) or ws.get("rows", [])
-                    cols_fields = ws.get("columns_fields", []) or ws.get("cols", [])
-                    rows_str = ", ".join(get_friendly_name(str(r)) for r in rows_fields if r) or "-"
-                    cols_str = ", ".join(get_friendly_name(str(c)) for c in cols_fields if c) or "-"
-
-                    # --- Dimensions from raw_model (or fallback from axes.dimensions) ---
-                    raw_dims = ws.get("dimensions", [])
-                    dimensions = [get_friendly_name(d) for d in raw_dims if d]
-
-                    # --- Measures (calculated + base) ---
-                    measures_raw = ws.get("measures", [])
-                    calc_fields_list = ws.get("calculated_fields", [])
-                    all_measures = []
-                    calc_names = []
-                    base_names = []
-                    for m in measures_raw:
-                        m_name = m.get("name") if isinstance(m, dict) else str(m)
-                        m_type = m.get("type", "") if isinstance(m, dict) else ""
-                        friendly = get_friendly_name(m_name)
-                        all_measures.append(friendly)
-                        if m_type == "calculated":
-                            calc_names.append(friendly)
-                        else:
-                            base_names.append(friendly)
-
-                    # If measures are empty, fallback: extract calc field names from calculated_fields
-                    if not calc_names and calc_fields_list:
-                        for cf in calc_fields_list:
-                            cf_name = cf.get("name") if isinstance(cf, dict) else str(cf)
-                            friendly = get_friendly_name(cf_name)
-                            calc_names.append(friendly)
-                            all_measures.append(friendly)
-
-                    # --- Filters ---
-                    filters_raw = ws.get("filters", [])
-                    filter_fields = [get_friendly_name(f.get("field", "")) for f in filters_raw if isinstance(f, dict) and f.get("field")]
-                    filters_str = ", ".join(filter_fields) if filter_fields else "-"
-
-                    # --- Calculated field formulas (from calculated_fields list) ---
-                    calc_details = []
-                    for cf in calc_fields_list:
-                        if isinstance(cf, dict):
-                            cf_name = get_friendly_name(cf.get("name", ""))
-                            cf_formula = cf.get("formula", "")
-                            if cf_name:
-                                calc_details.append(f"{cf_name}: {cf_formula}" if cf_formula else cf_name)
-
-                    worksheet_report_data.append({
-                        "Workbook": filename,
-                        "Worksheet Name": ws_name,
-                        "Chart Type": visual_type,
-                        "Rows Shelf": rows_str,
-                        "Columns Shelf": cols_str,
-                        "Dimensions": ", ".join(dimensions) if dimensions else "-",
-                        "All Measures": ", ".join(all_measures) if all_measures else "-",
-                        "Calculated Fields": ", ".join(calc_names) if calc_names else "-",
-                        "Calculated Field Formulas": " | ".join(calc_details) if calc_details else "-",
-                        "Base Measures": ", ".join(base_names) if base_names else "-",
-                        "Filters": filters_str,
-                    })
-
-
-            # --- 4. WRITE EXCEL FILE TO ZIP ---
-            excel_buffer = BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                # Sheet 1: DAX Conversions
-                df_dax = pd.DataFrame(dax_report_data)
-                df_dax.to_excel(writer, sheet_name='DAX Conversions', index=False)
-                
-                # Sheet 2: Worksheet Analysis
-                df_ws = pd.DataFrame(worksheet_report_data)
-                df_ws.to_excel(writer, sheet_name='Worksheet Analysis', index=False)
-
-                # Sheet 3: Data Tables
-                df_tables = pd.DataFrame(tables_report_data)
-                df_tables.to_excel(writer, sheet_name='Data Tables', index=False)
-
-                # Auto-adjust column widths for all sheets
-                for sheetname in writer.sheets:
-                    worksheet = writer.sheets[sheetname]
-                    for column in worksheet.columns:
-                        max_length = 0
-                        column_letter = column[0].column_letter
-                        for cell in column:
-                            try:
-                                if len(str(cell.value)) > max_length:
-                                    max_length = len(str(cell.value))
-                            except: pass
-                        adjusted_width = min(max_length + 2, 80)
-                        worksheet.column_dimensions[column_letter].width = adjusted_width
-
-            excel_buffer.seek(0)
+            excel_buffer = build_migration_excel_report(migration_id)
             zip_file.writestr(f"migration_report_{migration_id}.xlsx", excel_buffer.getvalue())
             # Include PBIP + table_data from exports/{migration_id}/
             # The orchestrator writes to: exports/{migration_id}/pbip_output/
